@@ -4,4 +4,16 @@ version = "0.1.0"
 description = ""
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "einops>=0.8.1",
+    "flash-attn>=2.8.3",
+    "icecream>=2.1.8",
+    "pandas>=2.3.2",
+    "pillow>=11.3.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "transformers[torch]==4.41.2", # Required by mPLUG-Owl3
+]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
