@@ -26,3 +26,9 @@ reportUninitializedInstanceVariable = "warning"
 reportUnnecessaryTypeIgnoreComment = "warning"
 reportUnreachable = "warning"
 reportUnusedCallResult = "warning"
+
+[tool.isort]
+no_sections = true
+lines_after_imports = 1
+comment_prefix = " #"
+line_length = 99999
