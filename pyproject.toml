@@ -4,4 +4,25 @@ version = "0.1.0"
 description = ""
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "huggingface-hub[cli]>=0.35.3",
+    "pandas>=2.3.3",
+]
+
+[tool.pyright]
+diagnosticMode = "workspace"
+strict = ["src/dataset-preprocessing-scripts/"]
+
+[[tool.pyright.executionEnvironments]]
+root = "src/dataset-preprocessing-scripts/"
+diagnosticMode = "workspace"
+reportCallInDefaultInitializer = "warning"
+reportImplicitOverride = "warning"
+reportImplicitStringConcatenation = "warning"
+reportImportCycles = "warning"
+reportMissingSuperCall = "warning"
+reportPropertyTypeMismatch = "warning"
+reportUninitializedInstanceVariable = "warning"
+reportUnnecessaryTypeIgnoreComment = "warning"
+reportUnreachable = "warning"
+reportUnusedCallResult = "warning"
