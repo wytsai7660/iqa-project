@@ -11,10 +11,10 @@ dependencies = [
 
 [tool.pyright]
 diagnosticMode = "workspace"
-strict = ["src/dataset-preprocessing-scripts/"]
+strict = ["src/dataset_preprocessing_scripts/"]
 
 [[tool.pyright.executionEnvironments]]
-root = "src/dataset-preprocessing-scripts/"
+root = "src/dataset_preprocessing_scripts/"
 diagnosticMode = "workspace"
 reportCallInDefaultInitializer = "warning"
 reportImplicitOverride = "warning"

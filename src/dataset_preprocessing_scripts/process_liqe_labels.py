@@ -13,38 +13,41 @@
 # and map the distortion types into the 11 ones described in the paper (the code
 # provided by the paper actually uses 33 types first, then maps them back into
 # 11 types).
+#
+# For the KADID-10k and BID datasets, the LIQE authors forgot to put a file that
+# contains the distortion and scene types of all the image samples (no file
+# named kadid10k_all_clip.txt under IQA_Database/kadid10k/splits2/ and no file
+# named bid_all_clip.txt, unlike the other datasets), so you need to manually
+# combine the three .txt files from any of the directories named 1 to 10 under
+# IQA_Database/kadid10k/splits2/ and IQA_Database/BID/splits2/ before passing
+# the merged file as the second argument to this script.
 
-from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, Namespace
-from pandas import merge, options, read_csv # pyright: ignore[reportUnknownVariableType]
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, BooleanOptionalAction, Namespace
+from pandas import options, read_csv # pyright: ignore[reportUnknownVariableType]
 from pathlib import PurePath
 from typing import Callable
 
 options.mode.copy_on_write = True
 
 def main(args: Namespace):
-    mos_stddev_dataframe = read_csv(
+    mos_stddev_data_frame = read_csv(
         args.mos_stddev_path,
         sep="\t",
         names=["filename", "mos", "stddev"],
         index_col="filename"
     )
-    distortion_scene_types_dataframe = read_csv(
+    distortion_scene_types_data_frame = read_csv(
         args.distortion_scene_types_path,
         sep="\t",
         names=["filename", "mos", "distortion", "scene1", "scene2", "scene3"],
-        index_col="filename"
+        index_col="filename",
+        usecols=["filename", "distortion", "scene1", "scene2", "scene3"]
     )
-    output_dataframe = merge(
-        mos_stddev_dataframe,
-        distortion_scene_types_dataframe[["distortion", "scene1", "scene2", "scene3"]],
-        left_index=True,
-        right_index=True,
-        sort=True,
-        validate="1:1"
-    )
-    get_last_path_segment: Callable[[str], str] = lambda filename: PurePath(filename).name
-    output_dataframe.index = output_dataframe.index.map(get_last_path_segment) # pyright: ignore[reportUnknownMemberType]
-    output_dataframe[["scene1", "scene2", "scene3"]] = output_dataframe[["scene1", "scene2", "scene3"]].replace("invalid", "") # pyright: ignore[reportUnknownMemberType]
+    output_data_frame = mos_stddev_data_frame.join(distortion_scene_types_data_frame, sort=True, validate="1:1")
+    if args.strip_filenames:
+        get_last_path_segment: Callable[[str], str] = lambda filename: PurePath(filename).name
+        output_data_frame.index = output_data_frame.index.map(get_last_path_segment) # pyright: ignore[reportUnknownMemberType]
+    output_data_frame[["scene1", "scene2", "scene3"]] = output_data_frame[["scene1", "scene2", "scene3"]].replace("invalid", "") # pyright: ignore[reportUnknownMemberType]
     distortion_type_map = {
         "jpeg2000 compression": "jpeg2000 compression",
         "jpeg compression": "jpeg compression",
@@ -80,8 +83,8 @@ def main(args: Namespace):
         "realistic contrast change": "contrast",
         "other realistic": "other"
     }
-    output_dataframe["distortion"] = output_dataframe["distortion"].map(distortion_type_map)
-    output_dataframe.to_csv(args.output_path)
+    output_data_frame["distortion"] = output_data_frame["distortion"].map(distortion_type_map)
+    output_data_frame.to_csv(args.output_path)
 
 if __name__ == "__main__":
     argument_parser = ArgumentParser(
@@ -97,4 +100,14 @@ if __name__ == "__main__":
         help="The path to store the output CSV.",
         nargs="?",
         default="labels.csv")
+    _ = argument_parser.add_argument("--strip-filenames",
+        help="""
+            Whether to strip all but the last path segment of the image sample
+            paths from the input files. Disabling this is useful for the LIVE
+            dataset, since it uses subdirectories, you can't merge all of the
+            image samples into one directory.
+            """,
+        default=True,
+        action=BooleanOptionalAction
+    )
     main(argument_parser.parse_args())
