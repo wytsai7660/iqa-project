@@ -1,0 +1,4 @@
+[submodule "src/owl3"]
+	path = src/owl3
+	url = git@hf.co:iqa-project/mPLUG-Owl3-7B-241101
+    update = merge
