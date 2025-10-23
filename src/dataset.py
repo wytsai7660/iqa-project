@@ -1,13 +1,14 @@
+import matplotlib.pyplot as plt
 from itertools import accumulate
 from numpy import array, diff, ndarray, searchsorted
-from owl3.processing_mplugowl3 import mPLUGOwl3BatchFeature, mPLUGOwl3Processor
+from owl3.processing_mplugowl3 import mPLUGOwl3BatchFeature, mPLUGOwl3ImageProcessor, mPLUGOwl3Processor
 from pandas import read_csv # pyright: ignore[reportUnknownVariableType]
 from pathlib import PurePath
 from PIL import Image
 from random import choice, randint
 from scipy.stats import norm # pyright: ignore[reportMissingTypeStubs]
 from torch.utils.data import Dataset
-from transformers import Qwen2Tokenizer # pyright: ignore[reportMissingTypeStubs]
+from transformers import AutoTokenizer, Qwen2Tokenizer # pyright: ignore[reportMissingTypeStubs]
 from typing import Iterable, TypedDict, override
 
 class PairDatasetImage(TypedDict):
@@ -185,25 +186,19 @@ if __name__ == "__main__":
     print(result)
     print(sum(result))
     print(type(result))
-    import matplotlib.pyplot as plt
-    from pathlib import Path
-    from transformers import AutoModel, AutoTokenizer
-
-    MODEL_DIR = "owl3"
-
+    MODEL_DIR = "./src/owl3"
     plt.bar(range(len(result)), result)
     plt.xlabel("Level")
     plt.ylabel("Probability")
     plt.title("Level Probabilities Distribution")
     plt.xticks(range(len(result)), ["0", "1", "2", "3", "4"])
     plt.savefig("level_probabilities_distribution.png")
-
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = AutoModel.from_pretrained(MODEL_DIR)
-    processor = model.init_processor(tokenizer)
-
+    # Taken from mPLUGOwl3Model.init_processor
+    image_processor = mPLUGOwl3ImageProcessor(image_size=378)
+    processor = mPLUGOwl3Processor(image_processor=image_processor, tokenizer=tokenizer)
     dataset = PairDataset(
-        dataset_paths=[Path("../data")],
+        dataset_paths=[PurePath("datasets/kadid-10k")],
         processor=processor,
         tokenizer=tokenizer,
     )
