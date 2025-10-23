@@ -1,15 +1,14 @@
 from itertools import accumulate
-from numpy import searchsorted
-from transformers import Qwen2Tokenizer # pyright: ignore[reportMissingTypeStubs]
+from numpy import array, diff, ndarray, searchsorted
 from owl3.processing_mplugowl3 import mPLUGOwl3BatchFeature, mPLUGOwl3Processor
 from pandas import read_csv # pyright: ignore[reportUnknownVariableType]
 from pathlib import PurePath
-from random import choice, randint
-from torch.utils.data import Dataset
-from typing import Any, Iterable, TypedDict, override
 from PIL import Image
-import numpy as np
-from scipy.stats import norm
+from random import choice, randint
+from scipy.stats import norm # pyright: ignore[reportMissingTypeStubs]
+from torch.utils.data import Dataset
+from transformers import Qwen2Tokenizer # pyright: ignore[reportMissingTypeStubs]
+from typing import Iterable, TypedDict, override
 
 class PairDatasetImage(TypedDict):
     """
@@ -20,7 +19,7 @@ class PairDatasetImage(TypedDict):
     quality_message: mPLUGOwl3BatchFeature
     distortion_type_message: mPLUGOwl3BatchFeature | None
     scene_type_message: mPLUGOwl3BatchFeature | None
-    level_probabilities: np.ndarray
+    level_probabilities: ndarray
 
 class PairDatasetItem(TypedDict):
     """
@@ -110,10 +109,10 @@ class PairDataset(Dataset[PairDatasetItem]):
         )
 
     @staticmethod
-    def get_level_probabilities(mos: float, stddev: float):
-        points = np.array([0, 1.25, 2.5, 3.75, 5.0])
-        probabilities = norm.pdf(points, loc=mos, scale=stddev)
-        probabilities = probabilities / probabilities.sum()
+    def get_level_probabilities(mos: float, stddev: float) -> ndarray:
+        cdf_points = array([1, 1.8, 2.6, 3.4, 4.2, 5])
+        cdf_values = norm.cdf(cdf_points, loc=mos, scale=stddev)
+        probabilities = diff(cdf_values)
         return probabilities
 
     def get_one_image(self, dataset_index: int, image_index: int) -> PairDatasetImage:
@@ -184,10 +183,11 @@ def collate_fn(batch):
 if __name__ == "__main__":
     result = PairDataset.get_level_probabilities(2.5, 1.0)
     print(result)
+    print(sum(result))
     print(type(result))
     import matplotlib.pyplot as plt
-    from transformers import AutoTokenizer, AutoModel
     from pathlib import Path
+    from transformers import AutoModel, AutoTokenizer
 
     MODEL_DIR = "owl3"
 
