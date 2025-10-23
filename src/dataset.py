@@ -8,16 +8,19 @@ from random import choice, randint
 from torch.utils.data import Dataset
 from typing import Any, Iterable, TypedDict, override
 from PIL import Image
+import numpy as np
+from scipy.stats import norm
 
 class PairDatasetImage(TypedDict):
     """
     The type of the values in a `PairDatasetItem` with the keys "image_1" and
     "image_2".
     """
+
     quality_message: mPLUGOwl3BatchFeature
-    distortion_type_message: mPLUGOwl3BatchFeature
-    scene_type_message: mPLUGOwl3BatchFeature
-    level_probabilities: list[float]
+    distortion_type_message: mPLUGOwl3BatchFeature | None
+    scene_type_message: mPLUGOwl3BatchFeature | None
+    level_probabilities: np.ndarray
 
 class PairDatasetItem(TypedDict):
     """
@@ -105,9 +108,13 @@ class PairDataset(Dataset[PairDatasetItem]):
             image_1=self.get_one_image(dataset_index, image_1_index),
             image_2=self.get_one_image(dataset_index, image_2_index)
         )
-    
-    def get_level_probabilities(self, mos: float, stddev: float) -> list[float]:
 
+    @staticmethod
+    def get_level_probabilities(mos: float, stddev: float):
+        points = np.array([0, 1.25, 2.5, 3.75, 5.0])
+        probabilities = norm.pdf(points, loc=mos, scale=stddev)
+        probabilities = probabilities / probabilities.sum()
+        return probabilities
 
     def get_one_image(self, dataset_index: int, image_index: int) -> PairDatasetImage:
         possible_quality_questions = [
@@ -152,11 +159,53 @@ class PairDataset(Dataset[PairDatasetItem]):
                 "content": ""
             }
         ]
-        image_path: str = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["filename"]
+        image_path: str = self.dataset_labels_data_frames[dataset_index].index[
+            image_index
+        ]
         image = Image.open(self.dataset_paths[dataset_index] / "images" / image_path)
         mos = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["mos"]
         stddev = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["stddev"]
-        level_probabilities = self.get_level_probabilities()
+        level_probabilities = self.get_level_probabilities(mos, stddev)
+        return {
+            "quality_message": self.processor(images=[image], messages=quality_message),
+            "distortion_type_message": None,
+            "scene_type_message": None,
+            "level_probabilities": level_probabilities,
+        }
     
     def __len__(self) -> int:
         return self.cumulative_dataset_image_counts[-1]
+
+
+def collate_fn(batch):
+    pass
+
+
+if __name__ == "__main__":
+    result = PairDataset.get_level_probabilities(2.5, 1.0)
+    print(result)
+    print(type(result))
+    import matplotlib.pyplot as plt
+    from transformers import AutoTokenizer, AutoModel
+    from pathlib import Path
+
+    MODEL_DIR = "owl3"
+
+    plt.bar(range(len(result)), result)
+    plt.xlabel("Level")
+    plt.ylabel("Probability")
+    plt.title("Level Probabilities Distribution")
+    plt.xticks(range(len(result)), ["0", "1", "2", "3", "4"])
+    plt.savefig("level_probabilities_distribution.png")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model = AutoModel.from_pretrained(MODEL_DIR)
+    processor = model.init_processor(tokenizer)
+
+    dataset = PairDataset(
+        dataset_paths=[Path("../data")],
+        processor=processor,
+        tokenizer=tokenizer,
+    )
+    dataset_item = dataset[0]
+    print(dataset_item)
