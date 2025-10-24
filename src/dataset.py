@@ -2,14 +2,14 @@ import matplotlib.pyplot as plt
 from itertools import accumulate
 from numpy import array, diff, ndarray, searchsorted
 from owl3.processing_mplugowl3 import mPLUGOwl3BatchFeature, mPLUGOwl3ImageProcessor, mPLUGOwl3Processor
-from pandas import read_csv # pyright: ignore[reportUnknownVariableType]
+from pandas import DataFrame, option_context, read_csv # pyright: ignore[reportUnknownVariableType]
 from pathlib import PurePath
 from PIL import Image
 from random import choice, randint
 from scipy.stats import norm # pyright: ignore[reportMissingTypeStubs]
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer, Qwen2Tokenizer # pyright: ignore[reportMissingTypeStubs]
-from typing import Iterable, TypedDict, override
+from typing import Iterable, Literal, TypedDict, override
 
 class PairDatasetImage(TypedDict):
     """
@@ -40,6 +40,7 @@ class PairDataset(Dataset[PairDatasetItem]):
         dataset_paths: Iterable[PurePath],
         processor: mPLUGOwl3Processor,
         tokenizer: Qwen2Tokenizer,
+        split: Literal["training", "validation", "testing"],
         args: PairDatasetArguments | None = None):
         """
         :param processor: The `mPLUGOwl3Processor` returned by
@@ -60,14 +61,20 @@ class PairDataset(Dataset[PairDatasetItem]):
         super().__init__()
         self.dataset_paths = list(dataset_paths)
         self.processor = processor
-        self.dataset_labels_data_frames = [
+        self.tokenizer = tokenizer
+        self.split = split
+        all_dataset_labels_data_frames = [
             read_csv(path / "labels.csv", keep_default_na=False, index_col="filename") # keep_default_na=False makes read_csv treat empty scene types as empty strings
             for path in dataset_paths
         ]
         """
         A `list` of `DataFrame`s where each element stores the `labels.csv` of
-        one dataset.
+        one dataset. We will use this and select only the image samples that
+        belong in the set specified by the split parameter.
         """
+        self.dataset_labels_data_frames: list[DataFrame] = []
+        for data_frame in all_dataset_labels_data_frames:
+            self.dataset_labels_data_frames.append(data_frame.loc[data_frame["set"] == split])
         self.dataset_image_counts = [len(data_frame.index) for data_frame in self.dataset_labels_data_frames]
         if any(dataset_image_count < 2 for dataset_image_count in self.dataset_image_counts):
             raise ValueError("Every dataset must have at least 2 images in it because image pairs can't be selected from a dataset with only 1 image.")
@@ -201,6 +208,9 @@ if __name__ == "__main__":
         dataset_paths=[PurePath("datasets/kadid-10k")],
         processor=processor,
         tokenizer=tokenizer,
+        split="validation"
     )
-    dataset_item = dataset[0]
-    print(dataset_item)
+    print(dataset[0])
+    with option_context("display.max_rows", None, "display.max_columns", None, "display.width", None):
+        for data_frame in dataset.dataset_labels_data_frames:
+            print(data_frame)
