@@ -74,6 +74,14 @@ class PairDataset(Dataset[PairDatasetItem]):
         """
         self.dataset_labels_data_frames: list[DataFrame] = []
         for data_frame in all_dataset_labels_data_frames:
+            # We always use loc here to avoid pandas' SettingWithCopyWarning.
+            data_frame.loc[:, :] = data_frame.loc[data_frame["set"] == split]
+            min_mos = data_frame["mos"].min()
+            max_mos = data_frame["mos"].max()
+            # Maps the MOS to [0, 1] first, then * 4 + 1 transforms it into [1,
+            # 5].
+            data_frame.loc[:, "mos_normalized"] = (data_frame["mos"] - min_mos) / (max_mos - min_mos) * 4 + 1
+            data_frame.loc[:, "stddev_normalized"] = data_frame["stddev"] / (max_mos - min_mos) * 4 # Only multiplications affect the standard deviation
             self.dataset_labels_data_frames.append(data_frame.loc[data_frame["set"] == split])
         self.dataset_image_counts = [len(data_frame.index) for data_frame in self.dataset_labels_data_frames]
         if any(dataset_image_count < 2 for dataset_image_count in self.dataset_image_counts):
@@ -170,8 +178,8 @@ class PairDataset(Dataset[PairDatasetItem]):
             image_index
         ]
         image = Image.open(self.dataset_paths[dataset_index] / "images" / image_path)
-        mos = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["mos"]
-        stddev = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["stddev"]
+        mos = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["mos_normalized"]
+        stddev = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["stddev_normalized"]
         level_probabilities = self.get_level_probabilities(mos, stddev)
         return {
             "quality_message": self.processor(images=[image], messages=quality_message),
@@ -205,12 +213,14 @@ if __name__ == "__main__":
     image_processor = mPLUGOwl3ImageProcessor(image_size=378)
     processor = mPLUGOwl3Processor(image_processor=image_processor, tokenizer=tokenizer)
     dataset = PairDataset(
-        dataset_paths=[PurePath("datasets/kadid-10k")],
+        dataset_paths=[PurePath("datasets/live")],
         processor=processor,
         tokenizer=tokenizer,
         split="validation"
     )
     print(dataset[0])
+    print(f"Sum of image_1's level_probabilities: {sum(dataset[0]["image_1"]["level_probabilities"])}")
+    print(f"Sum of image_2's level_probabilities: {sum(dataset[0]["image_2"]["level_probabilities"])}")
     with option_context("display.max_rows", None, "display.max_columns", None, "display.width", None):
         for data_frame in dataset.dataset_labels_data_frames:
             print(data_frame)
