@@ -1,3 +1,4 @@
+from copy import deepcopy
 import matplotlib.pyplot as plt
 from itertools import accumulate
 from numpy import array, diff, ndarray, searchsorted, inner
@@ -206,10 +207,9 @@ class PairDataset(Dataset[PairDatasetItem]):
         # not self.use_scene_labels and not self.use_distortion_labels => quality_message = image_prelude + quality_message
         image_path: str = self.dataset_labels_data_frames[dataset_index].index[image_index]
         image = Image.open(self.dataset_paths[dataset_index] / "images" / image_path).convert("RGB")
-        print(distortion_type_message)
         return {
-            "quality_message": self.processor(images=[image], messages=image_prelude + quality_message),
-            "distortion_type_message": self.processor(images=[image], messages=image_prelude + distortion_type_message) if self.use_distortion_labels else None,
+            "quality_message": self.processor(images=[image], messages=deepcopy(image_prelude) + quality_message),
+            "distortion_type_message": self.processor(images=[image], messages=deepcopy(image_prelude) + distortion_type_message) if self.use_distortion_labels else None,
             "scene_type_message": self.processor(images=[image], messages=image_prelude + scene_type_message) if self.use_scene_labels else None,
             "level_probabilities": level_probabilities,
         }
