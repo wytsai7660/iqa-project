@@ -16,7 +16,6 @@ class PairDatasetImage(TypedDict):
     The type of the values in a `PairDatasetItem` with the keys "image_1" and
     "image_2".
     """
-
     quality_message: mPLUGOwl3BatchFeature
     distortion_type_message: mPLUGOwl3BatchFeature | None
     scene_type_message: mPLUGOwl3BatchFeature | None
@@ -33,6 +32,8 @@ class PairDatasetArguments(TypedDict):
     """
     A `dict` that you can pass to `PairDataset` to customize its behavior.
     """
+    split: Literal["training", "validation", "testing"]
+    labels_to_use: Literal["quality-only", "quality-and-distortion", "quality-and-scene", "quality-and-distortion-and-scene"]
 
 class PairDataset(Dataset[PairDatasetItem]):
     def __init__(
@@ -40,8 +41,7 @@ class PairDataset(Dataset[PairDatasetItem]):
         dataset_paths: Iterable[PurePath],
         processor: mPLUGOwl3Processor,
         tokenizer: Qwen2Tokenizer,
-        split: Literal["training", "validation", "testing"],
-        args: PairDatasetArguments | None = None):
+        args: PairDatasetArguments):
         """
         :param processor: The `mPLUGOwl3Processor` returned by
             `mPLUGOwl3Model.init_processor`.
@@ -62,7 +62,7 @@ class PairDataset(Dataset[PairDatasetItem]):
         self.dataset_paths = list(dataset_paths)
         self.processor = processor
         self.tokenizer = tokenizer
-        self.split = split
+        self.split = args["split"]
         all_dataset_labels_data_frames = [
             read_csv(path / "labels.csv", keep_default_na=False, index_col="filename") # keep_default_na=False makes read_csv treat empty scene types as empty strings
             for path in dataset_paths
@@ -75,14 +75,14 @@ class PairDataset(Dataset[PairDatasetItem]):
         self.dataset_labels_data_frames: list[DataFrame] = []
         for data_frame in all_dataset_labels_data_frames:
             # We always use loc here to avoid pandas' SettingWithCopyWarning.
-            data_frame.loc[:, :] = data_frame.loc[data_frame["set"] == split]
+            data_frame.loc[:, :] = data_frame.loc[data_frame["set"] == self.split]
             min_mos = data_frame["mos"].min()
             max_mos = data_frame["mos"].max()
             # Maps the MOS to [0, 1] first, then * 4 + 1 transforms it into [1,
             # 5].
             data_frame.loc[:, "mos_normalized"] = (data_frame["mos"] - min_mos) / (max_mos - min_mos) * 4 + 1
             data_frame.loc[:, "stddev_normalized"] = data_frame["stddev"] / (max_mos - min_mos) * 4 # Only multiplications affect the standard deviation
-            self.dataset_labels_data_frames.append(data_frame.loc[data_frame["set"] == split])
+            self.dataset_labels_data_frames.append(data_frame.loc[data_frame["set"] == self.split])
         self.dataset_image_counts = [len(data_frame.index) for data_frame in self.dataset_labels_data_frames]
         if any(dataset_image_count < 2 for dataset_image_count in self.dataset_image_counts):
             raise ValueError("Every dataset must have at least 2 images in it because image pairs can't be selected from a dataset with only 1 image.")
@@ -216,7 +216,10 @@ if __name__ == "__main__":
         dataset_paths=[PurePath("datasets/live")],
         processor=processor,
         tokenizer=tokenizer,
-        split="validation"
+        args={
+            "split": "training",
+            "labels_to_use": "quality-and-distortion-and-scene"
+        }
     )
     print(dataset[0])
     print(f"Sum of image_1's level_probabilities: {sum(dataset[0]["image_1"]["level_probabilities"])}")
