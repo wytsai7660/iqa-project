@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 from itertools import accumulate
-from numpy import array, diff, ndarray, searchsorted
+from numpy import array, diff, ndarray, searchsorted, inner
 from owl3.processing_mplugowl3 import mPLUGOwl3BatchFeature, mPLUGOwl3ImageProcessor, mPLUGOwl3Processor
 from pandas import DataFrame, option_context, read_csv # pyright: ignore[reportUnknownVariableType]
 from pathlib import PurePath
@@ -129,10 +129,15 @@ class PairDataset(Dataset[PairDatasetItem]):
 
     @staticmethod
     def get_level_probabilities(mos: float, stddev: float) -> ndarray:
-        cdf_points = array([1, 1.8, 2.6, 3.4, 4.2, 5])
-        cdf_values = norm.cdf(cdf_points, loc=mos, scale=stddev)
-        probabilities = diff(cdf_values)
-        return probabilities
+        cdf_points = array([0.5, 1.5, 2.5, 3.5, 4.5, 5.5])
+        cdf_values = norm.cdf(cdf_points, loc=mos, scale=stddev) # pyright: ignore[reportUnknownMemberType]
+        p_raw = diff(cdf_values)
+        # Taken from 4th page of DeQA-Score, Post-adjustment section
+        p_raw_sum = p_raw.sum()
+        mu_rec = inner(array([1, 2, 3, 4, 5]), p_raw)
+        alpha = (mos - 3) / (mu_rec - 3 * p_raw_sum + 1e-9)
+        beta = (1 - alpha * p_raw_sum) / 5
+        return p_raw * alpha + beta
 
     def get_one_image(self, dataset_index: int, image_index: int) -> PairDatasetImage:
         possible_quality_questions = [
@@ -177,8 +182,6 @@ class PairDataset(Dataset[PairDatasetItem]):
                 "content": f"The distortion type of this image is {distortion_type}."
             }
         ]
-        if self.use_scene_labels:
-            distortion_type_message = scene_type_message + distortion_type_message
         quality_message = [
             {
                 "role": "user",
@@ -189,23 +192,25 @@ class PairDataset(Dataset[PairDatasetItem]):
                 "content": f"This quality of this image is {level_names[level_probabilities.argmax()]}."
             }
         ]
-        if self.use_distortion_labels:
+        if self.use_scene_labels and self.use_distortion_labels:
+            quality_message = scene_type_message + distortion_type_message + quality_message
+        elif self.use_distortion_labels:
             quality_message = distortion_type_message + quality_message
-        if self.use_scene_labels:
+        elif self.use_scene_labels:
             quality_message = scene_type_message + quality_message
-        scene_type_message = image_prelude + scene_type_message
-        distortion_type_message = image_prelude + distortion_type_message
-        quality_message = image_prelude + quality_message
+        if self.use_distortion_labels:
+            distortion_type_message = scene_type_message + distortion_type_message
         # self.use_scene_labels and self.use_distortion_labels => quality_message = image_prelude + scene_type_message + distortion_type_message + quality_message
         # not self.use_scene_labels and self.use_distortion_labels => quality_message = image_prelude + distortion_type_message + quality_message
         # self.use_scene_labels and not self.use_distortion_labels => quality_message = image_prelude + scene_type_message + quality_message
         # not self.use_scene_labels and not self.use_distortion_labels => quality_message = image_prelude + quality_message
         image_path: str = self.dataset_labels_data_frames[dataset_index].index[image_index]
         image = Image.open(self.dataset_paths[dataset_index] / "images" / image_path).convert("RGB")
+        print(distortion_type_message)
         return {
-            "quality_message": self.processor(images=[image], messages=quality_message),
-            "distortion_type_message": self.processor(images=[image], messages=distortion_type_message) if self.use_distortion_labels else None,
-            "scene_type_message": self.processor(images=[image], messages=scene_type_message) if self.use_scene_labels else None,
+            "quality_message": self.processor(images=[image], messages=image_prelude + quality_message),
+            "distortion_type_message": self.processor(images=[image], messages=image_prelude + distortion_type_message) if self.use_distortion_labels else None,
+            "scene_type_message": self.processor(images=[image], messages=image_prelude + scene_type_message) if self.use_scene_labels else None,
             "level_probabilities": level_probabilities,
         }
     
