@@ -33,7 +33,8 @@ class PairDatasetArguments(TypedDict):
     A `dict` that you can pass to `PairDataset` to customize its behavior.
     """
     split: Literal["training", "validation", "testing"]
-    labels_to_use: Literal["quality-only", "quality-and-distortion", "quality-and-scene", "quality-and-distortion-and-scene"]
+    use_scene_labels: bool
+    use_distortion_labels: bool
 
 class PairDataset(Dataset[PairDatasetItem]):
     def __init__(
@@ -63,6 +64,8 @@ class PairDataset(Dataset[PairDatasetItem]):
         self.processor = processor
         self.tokenizer = tokenizer
         self.split = args["split"]
+        self.use_scene_labels = args["use_scene_labels"]
+        self.use_distortion_labels = args["use_distortion_labels"]
         all_dataset_labels_data_frames = [
             read_csv(path / "labels.csv", keep_default_na=False, index_col="filename") # keep_default_na=False makes read_csv treat empty scene types as empty strings
             for path in dataset_paths
@@ -144,47 +147,65 @@ class PairDataset(Dataset[PairDatasetItem]):
             "Could you evaluate the quality of this image?",
             "How do you assess the quality of this image?"
         ]
-        quality_message = [
+        mos = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["mos_normalized"]
+        stddev = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["stddev_normalized"]
+        level_probabilities = array(self.get_level_probabilities(mos, stddev))
+        level_names = ["bad", "low", "fair", "good", "awesome"]
+        scene_type = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["scene1"]
+        distortion_type = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["distortion"]
+        image_prelude = [{
+            "role": "user",
+            "content": "<|image|>\n"
+        }]
+        scene_type_message = [
             {
                 "role": "user",
-                "content": f"<|image|>\n{choice(possible_quality_questions)}"
+                "content": "What is the scene type of this image?"
             },
             {
                 "role": "assistant",
-                "content": ""
+                "content": f"The scene type of this image is {scene_type}."
             }
         ]
         distortion_type_message = [
             {
                 "role": "user",
-                "content": f"<|image|>\nWhat is the distortion type of this image?"
+                "content": "What is the distortion type of this image?"
             },
             {
                 "role": "assistant",
-                "content": ""
+                "content": f"The distortion type of this image is {distortion_type}."
             }
         ]
-        scene_type_message = [
+        if self.use_scene_labels:
+            distortion_type_message = scene_type_message + distortion_type_message
+        quality_message = [
             {
                 "role": "user",
-                "content": f"<|image|>\nWhat is the scene type of this image?"
+                "content": f"{choice(possible_quality_questions)}"
             },
             {
                 "role": "assistant",
-                "content": ""
+                "content": f"This quality of this image is {level_names[level_probabilities.argmax()]}."
             }
         ]
-        image_path: str = self.dataset_labels_data_frames[dataset_index].index[
-            image_index
-        ]
-        image = Image.open(self.dataset_paths[dataset_index] / "images" / image_path)
-        mos = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["mos_normalized"]
-        stddev = self.dataset_labels_data_frames[dataset_index].iloc[image_index]["stddev_normalized"]
-        level_probabilities = self.get_level_probabilities(mos, stddev)
+        if self.use_distortion_labels:
+            quality_message = distortion_type_message + quality_message
+        if self.use_scene_labels:
+            quality_message = scene_type_message + quality_message
+        scene_type_message = image_prelude + scene_type_message
+        distortion_type_message = image_prelude + distortion_type_message
+        quality_message = image_prelude + quality_message
+        # self.use_scene_labels and self.use_distortion_labels => quality_message = image_prelude + scene_type_message + distortion_type_message + quality_message
+        # not self.use_scene_labels and self.use_distortion_labels => quality_message = image_prelude + distortion_type_message + quality_message
+        # self.use_scene_labels and not self.use_distortion_labels => quality_message = image_prelude + scene_type_message + quality_message
+        # not self.use_scene_labels and not self.use_distortion_labels => quality_message = image_prelude + quality_message
+        image_path: str = self.dataset_labels_data_frames[dataset_index].index[image_index]
+        image = Image.open(self.dataset_paths[dataset_index] / "images" / image_path).convert("RGB")
         return {
             "quality_message": self.processor(images=[image], messages=quality_message),
-            "distortion_type_message": None,
-            "scene_type_message": None,
+            "distortion_type_message": self.processor(images=[image], messages=distortion_type_message) if self.use_distortion_labels else None,
+            "scene_type_message": self.processor(images=[image], messages=scene_type_message) if self.use_scene_labels else None,
             "level_probabilities": level_probabilities,
         }
     
@@ -218,7 +239,8 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         args={
             "split": "training",
-            "labels_to_use": "quality-and-distortion-and-scene"
+            "use_distortion_labels": True,
+            "use_scene_labels": True
         }
     )
     print(dataset[0])
