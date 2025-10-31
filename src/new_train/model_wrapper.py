@@ -99,6 +99,14 @@ class IQAModelWrapper(nn.Module):
         self.use_fix_std = use_fix_std
         self.detach_pred_std = detach_pred_std
         self.binary_fidelity_type = binary_fidelity_type
+    
+    def gradient_checkpointing_enable(self, **kwargs):
+        """Enable gradient checkpointing for the underlying model."""
+        self.model.gradient_checkpointing_enable(**kwargs)
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for the underlying model."""
+        self.model.gradient_checkpointing_disable()
         
     def find_level_token_position(self, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
         """
@@ -160,6 +168,22 @@ class IQAModelWrapper(nn.Module):
         batch_size = logits.shape[0]
         vocab_size = logits.shape[-1]
         
+        # Check for NaN or invalid values in level_probs
+        if torch.isnan(level_probs).any():
+            print(f"[WARNING] NaN detected in level_probs: {level_probs}")
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
+        if (level_probs < 0).any() or (level_probs > 1).any():
+            print(f"[WARNING] Invalid values in level_probs (should be in [0,1]): {level_probs}")
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
+        # Check if level_probs sum to 1 (allow small tolerance)
+        probs_sum = level_probs.sum(dim=1)
+        if not torch.allclose(probs_sum, torch.ones_like(probs_sum), atol=1e-3):
+            print(f"[WARNING] level_probs don't sum to 1: {probs_sum}")
+            # Normalize
+            level_probs = level_probs / probs_sum.unsqueeze(1)
+        
         # Extract logits at level token positions (previous position for next token prediction)
         level_logits = logits[torch.arange(batch_size), level_positions - 1]  # [batch_size, vocab_size]
         
@@ -172,6 +196,15 @@ class IQAModelWrapper(nn.Module):
         # Compute KL divergence
         log_pred = F.log_softmax(level_logits, dim=-1)
         loss_kl = F.kl_div(log_pred, target, reduction="batchmean")
+        
+        # Check if KL loss is NaN
+        if torch.isnan(loss_kl):
+            print(f"[WARNING] NaN in KL loss!")
+            print(f"  level_logits stats: min={level_logits.min()}, max={level_logits.max()}, mean={level_logits.mean()}")
+            print(f"  log_pred stats: min={log_pred.min()}, max={log_pred.max()}, mean={log_pred.mean()}")
+            print(f"  target stats: min={target.min()}, max={target.max()}, sum={target.sum(dim=1)}")
+            print(f"  target non-zero: {(target > 0).sum()}")
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
         
         return loss_kl
     
@@ -372,87 +405,259 @@ class IQAModelWrapper(nn.Module):
     
     def forward_pair(
         self,
-        input_ids_A: torch.Tensor,
-        attention_mask_A: torch.Tensor,
+        # Quality task (main task)
+        input_ids_quality_A: torch.Tensor,
+        attention_mask_quality_A: torch.Tensor,
         pixel_values_A: torch.Tensor,
-        labels_A: torch.Tensor,
+        labels_quality_A: torch.Tensor,
         level_probs_A: torch.Tensor,
         gt_scores_A: torch.Tensor,
         gt_stds_A: torch.Tensor,
-        input_ids_B: torch.Tensor,
-        attention_mask_B: torch.Tensor,
+        input_ids_quality_B: torch.Tensor,
+        attention_mask_quality_B: torch.Tensor,
         pixel_values_B: torch.Tensor,
-        labels_B: torch.Tensor,
+        labels_quality_B: torch.Tensor,
         level_probs_B: torch.Tensor,
         gt_scores_B: torch.Tensor,
         gt_stds_B: torch.Tensor,
         media_offset_A: Optional[list] = None,
         media_offset_B: Optional[list] = None,
+        # Optional scene task
+        input_ids_scene_A: Optional[torch.Tensor] = None,
+        attention_mask_scene_A: Optional[torch.Tensor] = None,
+        labels_scene_A: Optional[torch.Tensor] = None,
+        input_ids_scene_B: Optional[torch.Tensor] = None,
+        attention_mask_scene_B: Optional[torch.Tensor] = None,
+        labels_scene_B: Optional[torch.Tensor] = None,
+        # Optional distortion task
+        input_ids_distortion_A: Optional[torch.Tensor] = None,
+        attention_mask_distortion_A: Optional[torch.Tensor] = None,
+        labels_distortion_A: Optional[torch.Tensor] = None,
+        input_ids_distortion_B: Optional[torch.Tensor] = None,
+        attention_mask_distortion_B: Optional[torch.Tensor] = None,
+        labels_distortion_B: Optional[torch.Tensor] = None,
+        # Task selection (for memory-efficient sequential processing)
+        active_task: Optional[str] = None,  # "scene", "distortion", or "quality"
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass for a pair of images (for fidelity loss).
+        Forward pass for a pair of images with multi-task support.
+        
+        If active_task is specified, only that task will be processed (memory-efficient).
+        If active_task is None, all tasks are processed together (original behavior).
+        
+        Main task (quality): Uses KL divergence loss and fidelity loss.
+        Auxiliary tasks (scene, distortion): Use only cross entropy loss.
         
         Returns:
             Dictionary with 'loss' and individual loss components
         """
-        # Forward for image A
-        outputs_A = self.forward_single(
-            input_ids_A, attention_mask_A, pixel_values_A, labels_A, level_probs_A, media_offset_A
-        )
+        total_loss = 0.0
+        loss_ce_total = 0.0
+        loss_kl_total = 0.0
+        loss_fidelity = torch.tensor(0.0, device=pixel_values_A.device)
+        logits = None
         
-        # Forward for image B
-        outputs_B = self.forward_single(
-            input_ids_B, attention_mask_B, pixel_values_B, labels_B, level_probs_B, media_offset_B
-        )
-        
-        # Get predicted scores
-        # Note: We search in input_ids, not labels, because labels have -100 for padding
-        level_positions_A = self.find_level_token_position(input_ids_A)
-        level_positions_B = self.find_level_token_position(input_ids_B)
-        
-        pred_scores_A, pred_stds_A = self.get_predicted_scores_and_stds(
-            outputs_A["logits"], level_positions_A
-        )
-        pred_scores_B, pred_stds_B = self.get_predicted_scores_and_stds(
-            outputs_B["logits"], level_positions_B
-        )
-        
-        # Compute fidelity loss
-        if gt_stds_A is not None and gt_stds_B is not None:
-            loss_fidelity = self.compute_fidelity_loss(
-                pred_scores_A, pred_stds_A, gt_scores_A, gt_stds_A,
-                pred_scores_B, pred_stds_B, gt_scores_B, gt_stds_B,
+        # === Scene task (optional, CE loss only) ===
+        if (active_task is None or active_task == "scene") and input_ids_scene_A is not None:
+            outputs_scene_A = self.forward_single(
+                input_ids_scene_A, attention_mask_scene_A, pixel_values_A, 
+                labels_scene_A, level_probs=None, media_offset=media_offset_A
             )
-        else:
-            loss_fidelity = self.compute_binary_fidelity_loss(
-                pred_scores_A, gt_scores_A, pred_scores_B, gt_scores_B
+            outputs_scene_B = self.forward_single(
+                input_ids_scene_B, attention_mask_scene_B, pixel_values_B,
+                labels_scene_B, level_probs=None, media_offset=media_offset_B
             )
+            total_loss += outputs_scene_A["loss"] + outputs_scene_B["loss"]
+            loss_ce_total += outputs_scene_A["loss_ce"] + outputs_scene_B["loss_ce"]
         
-        # Total loss
-        total_loss = (
-            outputs_A["loss"] + outputs_B["loss"] +
-            self.weight_fidelity * loss_fidelity
-        )
+        # === Distortion task (optional, CE loss only) ===
+        if (active_task is None or active_task == "distortion") and input_ids_distortion_A is not None:
+            outputs_distortion_A = self.forward_single(
+                input_ids_distortion_A, attention_mask_distortion_A, pixel_values_A,
+                labels_distortion_A, level_probs=None, media_offset=media_offset_A
+            )
+            outputs_distortion_B = self.forward_single(
+                input_ids_distortion_B, attention_mask_distortion_B, pixel_values_B,
+                labels_distortion_B, level_probs=None, media_offset=media_offset_B
+            )
+            total_loss += outputs_distortion_A["loss"] + outputs_distortion_B["loss"]
+            loss_ce_total += outputs_distortion_A["loss_ce"] + outputs_distortion_B["loss_ce"]
+        
+        # === Quality task (main task with KL loss and fidelity loss) ===
+        if active_task is None or active_task == "quality":
+            outputs_quality_A = self.forward_single(
+                input_ids_quality_A, attention_mask_quality_A, pixel_values_A,
+                labels_quality_A, level_probs_A, media_offset_A
+            )
+            outputs_quality_B = self.forward_single(
+                input_ids_quality_B, attention_mask_quality_B, pixel_values_B,
+                labels_quality_B, level_probs_B, media_offset_B
+            )
+            
+            # Get predicted scores for fidelity loss
+            level_positions_A = self.find_level_token_position(input_ids_quality_A)
+            level_positions_B = self.find_level_token_position(input_ids_quality_B)
+            
+            pred_scores_A, pred_stds_A = self.get_predicted_scores_and_stds(
+                outputs_quality_A["logits"], level_positions_A
+            )
+            pred_scores_B, pred_stds_B = self.get_predicted_scores_and_stds(
+                outputs_quality_B["logits"], level_positions_B
+            )
+            
+            # Compute fidelity loss
+            if gt_stds_A is not None and gt_stds_B is not None:
+                loss_fidelity = self.compute_fidelity_loss(
+                    pred_scores_A, pred_stds_A, gt_scores_A, gt_stds_A,
+                    pred_scores_B, pred_stds_B, gt_scores_B, gt_stds_B,
+                )
+            else:
+                loss_fidelity = self.compute_binary_fidelity_loss(
+                    pred_scores_A, gt_scores_A, pred_scores_B, gt_scores_B
+                )
+            
+            # Add quality task losses
+            total_loss += outputs_quality_A["loss"] + outputs_quality_B["loss"]
+            loss_ce_total += outputs_quality_A["loss_ce"] + outputs_quality_B["loss_ce"]
+            loss_kl_total += outputs_quality_A["loss_kl"] + outputs_quality_B["loss_kl"]
+            
+            # Add fidelity loss
+            total_loss += self.weight_fidelity * loss_fidelity
+            
+            # Include logits for validation metric computation (from quality task)
+            logits = outputs_quality_A["logits"]
         
         return {
             "loss": total_loss,
-            "loss_ce": outputs_A["loss_ce"] + outputs_B["loss_ce"],
-            "loss_kl": outputs_A["loss_kl"] + outputs_B["loss_kl"],
+            "loss_ce": loss_ce_total,
+            "loss_kl": loss_kl_total,
             "loss_fidelity": loss_fidelity,
-            # Include logits for validation metric computation
-            "logits": outputs_A["logits"],  # Use logits from image A for metrics
+            "logits": logits,
+        }
+    
+    def forward_scene_task(
+        self,
+        input_ids_scene_A: torch.Tensor,
+        attention_mask_scene_A: torch.Tensor,
+        labels_scene_A: torch.Tensor,
+        input_ids_scene_B: torch.Tensor,
+        attention_mask_scene_B: torch.Tensor,
+        labels_scene_B: torch.Tensor,
+        pixel_values_A: torch.Tensor,
+        pixel_values_B: torch.Tensor,
+        media_offset_A: list,
+        media_offset_B: list,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for scene classification task.
+        Only processes scene inputs, ignoring quality task completely.
+        """
+        # Forward pass for image A
+        outputs_A = self.model(
+            input_ids=input_ids_scene_A,
+            attention_mask=attention_mask_scene_A,
+            pixel_values=pixel_values_A,
+            media_offset=media_offset_A,
+            labels=labels_scene_A,
+            return_dict=True,
+        )
+        
+        # Forward pass for image B
+        outputs_B = self.model(
+            input_ids=input_ids_scene_B,
+            attention_mask=attention_mask_scene_B,
+            pixel_values=pixel_values_B,
+            media_offset=media_offset_B,
+            labels=labels_scene_B,
+            return_dict=True,
+        )
+        
+        # Compute total CE loss (average of A and B)
+        loss_ce_A = outputs_A["loss"]
+        loss_ce_B = outputs_B["loss"]
+        loss_ce_total = (loss_ce_A + loss_ce_B) / 2
+        
+        return {
+            "loss": loss_ce_total,
+            "loss_ce": loss_ce_total,
+            "logits": outputs_A["logits"],  # Return logits for metrics
+        }
+    
+    def forward_distortion_task(
+        self,
+        input_ids_distortion_A: torch.Tensor,
+        attention_mask_distortion_A: torch.Tensor,
+        labels_distortion_A: torch.Tensor,
+        input_ids_distortion_B: torch.Tensor,
+        attention_mask_distortion_B: torch.Tensor,
+        labels_distortion_B: torch.Tensor,
+        pixel_values_A: torch.Tensor,
+        pixel_values_B: torch.Tensor,
+        media_offset_A: list,
+        media_offset_B: list,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for distortion classification task.
+        Only processes distortion inputs, ignoring quality task completely.
+        """
+        # Forward pass for image A
+        outputs_A = self.model(
+            input_ids=input_ids_distortion_A,
+            attention_mask=attention_mask_distortion_A,
+            pixel_values=pixel_values_A,
+            media_offset=media_offset_A,
+            labels=labels_distortion_A,
+            return_dict=True,
+        )
+        
+        # Forward pass for image B
+        outputs_B = self.model(
+            input_ids=input_ids_distortion_B,
+            attention_mask=attention_mask_distortion_B,
+            pixel_values=pixel_values_B,
+            media_offset=media_offset_B,
+            labels=labels_distortion_B,
+            return_dict=True,
+        )
+        
+        # Compute total CE loss (average of A and B)
+        loss_ce_A = outputs_A["loss"]
+        loss_ce_B = outputs_B["loss"]
+        loss_ce_total = (loss_ce_A + loss_ce_B) / 2
+        
+        return {
+            "loss": loss_ce_total,
+            "loss_ce": loss_ce_total,
+            "logits": outputs_A["logits"],  # Return logits for metrics
         }
     
     def forward(self, **kwargs):
         """
         Forward pass dispatcher.
+        Detects the task type and routes to appropriate forward method.
         """
         # Remove trainer-specific arguments that shouldn't be passed to model
         kwargs.pop('num_items_in_batch', None)
         kwargs.pop('return_outputs', None)
         
-        # Check if this is a pair dataset (has both A and B images)
-        if "input_ids_A" in kwargs and "input_ids_B" in kwargs:
+        # Detect task type based on which input keys are present
+        has_quality_A = "input_ids_quality_A" in kwargs
+        has_quality_B = "input_ids_quality_B" in kwargs
+        has_scene_A = "input_ids_scene_A" in kwargs
+        has_scene_B = "input_ids_scene_B" in kwargs
+        has_distortion_A = "input_ids_distortion_A" in kwargs
+        has_distortion_B = "input_ids_distortion_B" in kwargs
+        
+        # Route to appropriate forward method based on task
+        if has_quality_A and has_quality_B:
+            # Quality task (full pipeline)
             return self.forward_pair(**kwargs)
+        elif has_scene_A and has_scene_B:
+            # Scene classification task
+            return self.forward_scene_task(**kwargs)
+        elif has_distortion_A and has_distortion_B:
+            # Distortion classification task
+            return self.forward_distortion_task(**kwargs)
         else:
+            # Single image inference
             return self.forward_single(**kwargs)

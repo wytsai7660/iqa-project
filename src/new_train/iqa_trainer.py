@@ -27,12 +27,20 @@ class SimplifiedProgressCallback(TrainerCallback):
                 print(f"📊 Validation Results at Epoch {logs.get('epoch', 0):.2f}")
                 print(f"{'='*70}")
                 
-                # Loss metric
-                print(f"  Loss:       {logs['eval_loss']:.6f}")
+                # Total Loss
+                print(f"  Total Loss: {logs['eval_loss']:.6f}")
+                
+                # Loss components (if available)
+                if 'eval_loss_ce' in logs:
+                    print(f"  - CE Loss:      {logs['eval_loss_ce']:.6f}")
+                if 'eval_loss_kl' in logs:
+                    print(f"  - KL Loss:      {logs['eval_loss_kl']:.6f}")
+                if 'eval_loss_fidelity' in logs:
+                    print(f"  - Fidelity Loss: {logs['eval_loss_fidelity']:.6f}")
                 
                 # Regression metrics (MAE, RMSE)
                 if 'eval_mae' in logs:
-                    print(f"  MAE:        {logs['eval_mae']:.4f}")
+                    print(f"\n  MAE:        {logs['eval_mae']:.4f}")
                 if 'eval_rmse' in logs:
                     print(f"  RMSE:       {logs['eval_rmse']:.4f}")
                 
@@ -70,27 +78,44 @@ class IQATrainer(Trainer):
         self.eval_predictions = []
         self.eval_labels = []
         
+        # Store loss components for detailed logging
+        self.eval_loss_ce_list = []
+        self.eval_loss_kl_list = []
+        self.eval_loss_fidelity_list = []
+        
         # Remove default PrinterCallback and add our simplified one
         self.remove_callback(PrinterCallback)
         self.add_callback(SimplifiedProgressCallback)
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
-        Compute loss and ensure it's properly formatted.
-        """
-        # Forward pass
-        outputs = model(**inputs)
+        Compute loss for quality assessment task.
         
-        # Extract loss
-        if isinstance(outputs, dict):
-            loss = outputs.get("loss")
+        For multi-task training, use train_scene.py and train_distortion.py separately
+        to avoid OOM issues. This trainer focuses on the quality task only.
+        """
+        # Only process quality task
+        quality_inputs = {**inputs, "active_task": "quality"}
+        quality_outputs = model(**quality_inputs)
+        
+        quality_loss = quality_outputs.get("loss") if isinstance(quality_outputs, dict) else quality_outputs[0]
+        
+        # Prepare outputs
+        if isinstance(quality_outputs, dict):
+            outputs = {
+                "loss": quality_loss,
+                "loss_ce": quality_outputs.get("loss_ce", 0.0),
+                "loss_kl": quality_outputs.get("loss_kl", 0.0),
+                "loss_fidelity": quality_outputs.get("loss_fidelity", 0.0),
+                "logits": quality_outputs.get("logits"),
+            }
         else:
-            loss = outputs[0] if isinstance(outputs, tuple) else outputs.loss
+            outputs = quality_outputs
         
         # Return loss and outputs if requested
         if return_outputs:
-            return loss, outputs
-        return loss
+            return quality_loss, outputs
+        return quality_loss
     
     def prediction_step(
         self,
@@ -111,6 +136,20 @@ class IQATrainer(Trainer):
                 loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
                 loss = loss.mean().detach()
                 
+                # Store loss components for detailed logging
+                if isinstance(outputs, dict):
+                    loss_ce = outputs.get("loss_ce", torch.tensor(0.0))
+                    loss_kl = outputs.get("loss_kl", torch.tensor(0.0))
+                    loss_fidelity = outputs.get("loss_fidelity", torch.tensor(0.0))
+                    
+                    # Convert to float and store
+                    if isinstance(loss_ce, torch.Tensor):
+                        self.eval_loss_ce_list.append(loss_ce.item())
+                    if isinstance(loss_kl, torch.Tensor):
+                        self.eval_loss_kl_list.append(loss_kl.item())
+                    if isinstance(loss_fidelity, torch.Tensor):
+                        self.eval_loss_fidelity_list.append(loss_fidelity.item())
+                
                 # Extract logits for this batch only
                 if isinstance(outputs, dict):
                     logits = outputs.get("logits")
@@ -121,13 +160,13 @@ class IQATrainer(Trainer):
                 # We need to extract quality scores to compute PLCC/SRCC
                 if logits is not None:
                     # For pair dataset, extract quality scores from image A
-                    # Use input_ids_A to find level positions (not labels_A, which has -100 padding)
-                    input_ids_A = inputs.get("input_ids_A")
-                    labels_A = inputs.get("labels_A")
+                    # Use input_ids_quality_A to find level positions (not labels, which has -100 padding)
+                    input_ids_quality_A = inputs.get("input_ids_quality_A")
+                    labels_quality_A = inputs.get("labels_quality_A")
                     
-                    if input_ids_A is not None and labels_A is not None:
-                        # Find level token positions in input_ids_A
-                        level_positions = self.model.find_level_token_position(input_ids_A)
+                    if input_ids_quality_A is not None and labels_quality_A is not None:
+                        # Find level token positions in input_ids_quality_A
+                        level_positions = self.model.find_level_token_position(input_ids_quality_A)
                         if level_positions is not None and (level_positions >= 0).any():
                             # Compute predicted scores for this batch
                             from src.new_train.metrics import compute_quality_score_from_logits
@@ -155,7 +194,7 @@ class IQATrainer(Trainer):
                             elif not (level_positions >= 0).any():
                                 print(f"[DEBUG] No valid level positions found: {level_positions}")
                     else:
-                        print("[DEBUG] No input_ids_A or labels_A in inputs")
+                        print("[DEBUG] No input_ids_quality_A or labels_quality_A in inputs")
                 else:
                     print("[DEBUG] No logits in outputs")
             else:
@@ -171,12 +210,35 @@ class IQATrainer(Trainer):
         # Reset accumulators
         self.eval_predictions = []
         self.eval_labels = []
+        self.eval_loss_ce_list = []
+        self.eval_loss_kl_list = []
+        self.eval_loss_fidelity_list = []
         
         # Run parent's evaluation loop
         output = super().evaluation_loop(*args, **kwargs)
         
         # Debug: print collected predictions
         print(f"\n[DEBUG] Collected {len(self.eval_predictions)} predictions")
+        print(f"[DEBUG] Collected {len(self.eval_loss_ce_list)} loss_ce values")
+        print(f"[DEBUG] Collected {len(self.eval_loss_kl_list)} loss_kl values")
+        print(f"[DEBUG] Collected {len(self.eval_loss_fidelity_list)} loss_fidelity values")
+        
+        # Add detailed loss components to metrics
+        if output.metrics is not None:
+            if len(self.eval_loss_ce_list) > 0:
+                avg_loss_ce = np.mean(self.eval_loss_ce_list)
+                output.metrics['eval_loss_ce'] = avg_loss_ce
+                print(f"[DEBUG] Average loss_ce: {avg_loss_ce:.6f}")
+            
+            if len(self.eval_loss_kl_list) > 0:
+                avg_loss_kl = np.mean(self.eval_loss_kl_list)
+                output.metrics['eval_loss_kl'] = avg_loss_kl
+                print(f"[DEBUG] Average loss_kl: {avg_loss_kl:.6f}")
+            
+            if len(self.eval_loss_fidelity_list) > 0:
+                avg_loss_fidelity = np.mean(self.eval_loss_fidelity_list)
+                output.metrics['eval_loss_fidelity'] = avg_loss_fidelity
+                print(f"[DEBUG] Average loss_fidelity: {avg_loss_fidelity:.6f}")
         
         # Compute aggregated metrics if we have predictions
         if len(self.eval_predictions) > 0:
@@ -203,5 +265,8 @@ class IQATrainer(Trainer):
         # Clear accumulators
         self.eval_predictions = []
         self.eval_labels = []
+        self.eval_loss_ce_list = []
+        self.eval_loss_kl_list = []
+        self.eval_loss_fidelity_list = []
         
         return output

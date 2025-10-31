@@ -21,6 +21,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Disable tokenizers parallelism
 
 import argparse
 import sys
+import shutil
 from pathlib import Path
 
 from transformers import (
@@ -62,6 +63,10 @@ def parse_args():
                         help="Maximum sequence length")
     parser.add_argument("--image_size", type=int, default=378,
                         help="Image size")
+    parser.add_argument("--use_scene_labels", action="store_true",
+                        help="Enable scene type classification task")
+    parser.add_argument("--use_distortion_labels", action="store_true",
+                        help="Enable distortion type classification task")
     
     # Loss arguments
     parser.add_argument("--weight_ce", type=float, default=1.0,
@@ -142,6 +147,8 @@ def main():
         tokenizer=tokenizer,
         split="training",
         max_length=args.max_length,
+        use_scene_labels=args.use_scene_labels,
+        use_distortion_labels=args.use_distortion_labels,
     )
     val_dataset = IQAPairDataset(
         dataset_paths=args.dataset_paths,
@@ -149,6 +156,8 @@ def main():
         tokenizer=tokenizer,
         split="validation",
         max_length=args.max_length,
+        use_scene_labels=args.use_scene_labels,
+        use_distortion_labels=args.use_distortion_labels,
     )
     print(f"Training dataset size: {len(train_dataset)}")
     print(f"Validation dataset size: {len(val_dataset)}")
@@ -213,11 +222,36 @@ def main():
     trainer.train()
     print("=" * 60)
     
-    # Save final model
+    # Save final model (both full model and LoRA adapter)
     print("\nSaving final model...")
-    model.model.save_pretrained(f"{args.output_dir}/final")
-    tokenizer.save_pretrained(f"{args.output_dir}/final")
-    print(f"✅ Model saved to {args.output_dir}/final")
+    final_model_path = f"{args.output_dir}/final"
+    
+    # Save LoRA adapter
+    model.model.save_pretrained(final_model_path)
+    tokenizer.save_pretrained(final_model_path)
+    
+    # Copy base model config for standalone loading
+    base_model_path = Path(args.model_name_or_path)
+    
+    # Copy JSON/text config files
+    for file in ["config.json", "generation_config.json", "preprocessor_config.json", "processor_config.json"]:
+        src = base_model_path / file
+        if src.exists():
+            dst = Path(final_model_path) / file
+            shutil.copy2(src, dst)
+            print(f"  Copied {file}")
+    
+    # Copy Python modeling files (required for trust_remote_code=True)
+    for file in ["configuration_mplugowl3.py", "modeling_mplugowl3.py", 
+                 "configuration_hyper_qwen2.py", "modeling_hyper_qwen2.py",
+                 "image_processing_mplugowl3.py", "processing_mplugowl3.py"]:
+        src = base_model_path / file
+        if src.exists():
+            dst = Path(final_model_path) / file
+            shutil.copy2(src, dst)
+            print(f"  Copied {file}")
+    
+    print(f"✅ Model saved to {final_model_path}")
     
     # Generate training curves
     print("\nGenerating training curves...")

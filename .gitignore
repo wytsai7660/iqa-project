@@ -10,3 +10,8 @@ wheels/
 .venv
 
 datasets
+
+*.md
+ref/
+datasets/
+outputs/

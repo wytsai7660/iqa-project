@@ -2,7 +2,7 @@ from copy import deepcopy
 import matplotlib.pyplot as plt
 from itertools import accumulate
 from numpy import array, diff, ndarray, searchsorted, inner
-from owl3.processing_mplugowl3 import mPLUGOwl3BatchFeature, mPLUGOwl3ImageProcessor, mPLUGOwl3Processor
+from src.owl3.processing_mplugowl3 import mPLUGOwl3BatchFeature, mPLUGOwl3ImageProcessor, mPLUGOwl3Processor
 from pandas import DataFrame, option_context, read_csv # pyright: ignore[reportUnknownVariableType]
 from pathlib import PurePath
 from PIL import Image
@@ -11,15 +11,21 @@ from scipy.stats import norm # pyright: ignore[reportMissingTypeStubs]
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer, Qwen2Tokenizer # pyright: ignore[reportMissingTypeStubs]
 from typing import Iterable, Literal, TypedDict, override
+import numpy as np
 
 class PairDatasetImage(TypedDict):
     """
     The type of the values in a `PairDatasetItem` with the keys "image_1" and
     "image_2".
+    
+    Updated structure for independent task training:
+    - scene_type_message: Image + scene Q&A only
+    - distortion_type_message: Image + scene Q&A + distortion Q&A
+    - quality_message: Image + scene Q&A + distortion Q&A + quality Q&A
     """
     quality_message: mPLUGOwl3BatchFeature
-    distortion_type_message: mPLUGOwl3BatchFeature | None
-    scene_type_message: mPLUGOwl3BatchFeature | None
+    distortion_type_message: mPLUGOwl3BatchFeature
+    scene_type_message: mPLUGOwl3BatchFeature
     level_probabilities: ndarray
 
 class PairDatasetItem(TypedDict):
@@ -33,7 +39,7 @@ class PairDatasetArguments(TypedDict):
     """
     A `dict` that you can pass to `PairDataset` to customize its behavior.
     """
-    split: Literal["training", "validation", "testing"]
+    split: Literal["training", "validation", "testing", "full"]
     use_scene_labels: bool
     use_distortion_labels: bool
 
@@ -43,7 +49,11 @@ class PairDataset(Dataset[PairDatasetItem]):
         dataset_paths: Iterable[PurePath],
         processor: mPLUGOwl3Processor,
         tokenizer: Qwen2Tokenizer,
-        args: PairDatasetArguments):
+        args: PairDatasetArguments | None = None,
+        # Legacy parameters for backward compatibility
+        split: str | None = None,
+        use_scene_labels: bool = False,
+        use_distortion_labels: bool = False):
         """
         :param processor: The `mPLUGOwl3Processor` returned by
             `mPLUGOwl3Model.init_processor`.
@@ -64,9 +74,18 @@ class PairDataset(Dataset[PairDatasetItem]):
         self.dataset_paths = list(dataset_paths)
         self.processor = processor
         self.tokenizer = tokenizer
-        self.split = args["split"]
-        self.use_scene_labels = args["use_scene_labels"]
-        self.use_distortion_labels = args["use_distortion_labels"]
+        
+        # Handle both new args dict and legacy parameters
+        if args is not None:
+            self.split = args["split"]
+            self.use_scene_labels = args["use_scene_labels"]
+            self.use_distortion_labels = args["use_distortion_labels"]
+        else:
+            # Use legacy parameters
+            self.split = split if split is not None else "training"
+            self.use_scene_labels = use_scene_labels
+            self.use_distortion_labels = use_distortion_labels
+        
         all_dataset_labels_data_frames = [
             read_csv(path / "labels.csv", keep_default_na=False, index_col="filename") # keep_default_na=False makes read_csv treat empty scene types as empty strings
             for path in dataset_paths
@@ -79,14 +98,19 @@ class PairDataset(Dataset[PairDatasetItem]):
         self.dataset_labels_data_frames: list[DataFrame] = []
         for data_frame in all_dataset_labels_data_frames:
             # We always use loc here to avoid pandas' SettingWithCopyWarning.
-            data_frame.loc[:, :] = data_frame.loc[data_frame["set"] == self.split]
-            min_mos = data_frame["mos"].min()
-            max_mos = data_frame["mos"].max()
-            # Maps the MOS to [0, 1] first, then * 4 + 1 transforms it into [1,
-            # 5].
-            data_frame.loc[:, "mos_normalized"] = (data_frame["mos"] - min_mos) / (max_mos - min_mos) * 4 + 1
-            data_frame.loc[:, "stddev_normalized"] = data_frame["stddev"] / (max_mos - min_mos) * 4 # Only multiplications affect the standard deviation
-            self.dataset_labels_data_frames.append(data_frame.loc[data_frame["set"] == self.split])
+            if self.split == "full":
+                # Use all data regardless of split
+                filtered_data_frame = data_frame.copy()
+            else:
+                # Filter by specific split
+                filtered_data_frame = data_frame.loc[data_frame["set"] == self.split].copy()
+            
+            min_mos = filtered_data_frame["mos"].min()
+            max_mos = filtered_data_frame["mos"].max()
+            # Maps the MOS to [0, 1] first, then * 4 + 1 transforms it into [1, 5].
+            filtered_data_frame.loc[:, "mos_normalized"] = (filtered_data_frame["mos"] - min_mos) / (max_mos - min_mos) * 4 + 1
+            filtered_data_frame.loc[:, "stddev_normalized"] = filtered_data_frame["stddev"] / (max_mos - min_mos) * 4 # Only multiplications affect the standard deviation
+            self.dataset_labels_data_frames.append(filtered_data_frame)
         self.dataset_image_counts = [len(data_frame.index) for data_frame in self.dataset_labels_data_frames]
         if any(dataset_image_count < 2 for dataset_image_count in self.dataset_image_counts):
             raise ValueError("Every dataset must have at least 2 images in it because image pairs can't be selected from a dataset with only 1 image.")
@@ -136,9 +160,31 @@ class PairDataset(Dataset[PairDatasetItem]):
         # Taken from 4th page of DeQA-Score, Post-adjustment section
         p_raw_sum = p_raw.sum()
         mu_rec = inner(array([1, 2, 3, 4, 5]), p_raw)
-        alpha = (mos - 3) / (mu_rec - 3 * p_raw_sum + 1e-9)
-        beta = (1 - alpha * p_raw_sum) / 5
-        return p_raw * alpha + beta
+        
+        # Safe division with larger epsilon to avoid NaN
+        denominator = mu_rec - 3 * p_raw_sum
+        if abs(denominator) < 1e-6:  # Increased from 1e-9
+            # Fallback to simple normalization if denominator is too small
+            alpha = 1.0
+            beta = 0.0
+        else:
+            alpha = (mos - 3) / denominator
+            beta = (1 - alpha * p_raw_sum) / 5
+        
+        probs = p_raw * alpha + beta
+        
+        # Ensure probabilities are valid
+        probs = np.clip(probs, 0.0, 1.0)
+        
+        # Normalize to sum to 1
+        probs_sum = probs.sum()
+        if probs_sum > 0:
+            probs = probs / probs_sum
+        else:
+            # Fallback: uniform distribution
+            probs = np.ones(5) / 5
+        
+        return probs
 
     def get_one_image(self, dataset_index: int, image_index: int) -> PairDatasetImage:
         possible_quality_questions = [
@@ -163,7 +209,9 @@ class PairDataset(Dataset[PairDatasetItem]):
             "role": "user",
             "content": "<|image|>\n"
         }]
-        scene_type_message = [
+        
+        # Build message components
+        scene_qa = [
             {
                 "role": "user",
                 "content": "What is the scene type of this image?"
@@ -173,7 +221,7 @@ class PairDataset(Dataset[PairDatasetItem]):
                 "content": f"The scene type of this image is {scene_type}."
             }
         ]
-        distortion_type_message = [
+        distortion_qa = [
             {
                 "role": "user",
                 "content": "What is the distortion type of this image?"
@@ -183,34 +231,46 @@ class PairDataset(Dataset[PairDatasetItem]):
                 "content": f"The distortion type of this image is {distortion_type}."
             }
         ]
-        quality_message = [
+        quality_qa = [
             {
                 "role": "user",
                 "content": f"{choice(possible_quality_questions)}"
             },
             {
                 "role": "assistant",
-                "content": f"This quality of this image is {level_names[level_probabilities.argmax()]}."
+                "content": f"The quality of this image is {level_names[level_probabilities.argmax()]}."
             }
         ]
-        if self.use_scene_labels and self.use_distortion_labels:
-            quality_message = scene_type_message + distortion_type_message + quality_message
-        elif self.use_distortion_labels:
-            quality_message = distortion_type_message + quality_message
-        elif self.use_scene_labels:
-            quality_message = scene_type_message + quality_message
+        
+        # Build messages for each task independently
+        # Task 1: Scene - just answer scene based on image
+        scene_type_message = image_prelude + scene_qa
+        
+        # Task 2: Distortion - conditionally include scene context based on use_scene_labels
+        if self.use_scene_labels:
+            distortion_type_message = image_prelude + scene_qa + distortion_qa
+        else:
+            distortion_type_message = image_prelude + distortion_qa
+        
+        # Task 3: Quality - conditionally include scene/distortion context
+        quality_components = [image_prelude]
+        if self.use_scene_labels:
+            quality_components.append(scene_qa)
         if self.use_distortion_labels:
-            distortion_type_message = scene_type_message + distortion_type_message
-        # self.use_scene_labels and self.use_distortion_labels => quality_message = image_prelude + scene_type_message + distortion_type_message + quality_message
-        # not self.use_scene_labels and self.use_distortion_labels => quality_message = image_prelude + distortion_type_message + quality_message
-        # self.use_scene_labels and not self.use_distortion_labels => quality_message = image_prelude + scene_type_message + quality_message
-        # not self.use_scene_labels and not self.use_distortion_labels => quality_message = image_prelude + quality_message
+            quality_components.append(distortion_qa)
+        quality_components.append(quality_qa)
+        quality_message = sum(quality_components, [])
+        
+        # Load image
         image_path: str = self.dataset_labels_data_frames[dataset_index].index[image_index]
         image = Image.open(self.dataset_paths[dataset_index] / "images" / image_path).convert("RGB")
+        
+        # Always process all three task messages for maximum flexibility in training
+        # This allows training any task independently without conditional logic
         return {
-            "quality_message": self.processor(images=[image], messages=deepcopy(image_prelude) + quality_message),
-            "distortion_type_message": self.processor(images=[image], messages=deepcopy(image_prelude) + distortion_type_message) if self.use_distortion_labels else None,
-            "scene_type_message": self.processor(images=[image], messages=image_prelude + scene_type_message) if self.use_scene_labels else None,
+            "quality_message": self.processor(images=[image], messages=deepcopy(quality_message)),
+            "distortion_type_message": self.processor(images=[image], messages=deepcopy(distortion_type_message)),
+            "scene_type_message": self.processor(images=[image], messages=deepcopy(scene_type_message)),
             "level_probabilities": level_probabilities,
         }
     
