@@ -13,3 +13,4 @@ ref/
 datasets/
 outputs/
 *.log
+*.png
