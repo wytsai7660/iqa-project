@@ -9,9 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-datasets
-
-*.md
 ref/
 datasets/
 outputs/
+*.log
