@@ -137,14 +137,6 @@ uv run python eval_sequential_model.py \
     --split testing
 ```
 
-### Simple Evaluation
-
-```bash
-uv run python evaluate_model.py \
-    --model_path outputs/03_quality/final \
-    --dataset_paths datasets/live/
-```
-
 ## Code Architecture
 
 ### Core Modules
@@ -238,6 +230,10 @@ Scripts to process raw IQA datasets into the format expected by `PairDataset`:
 - `process_liqe_labels.py`: Process LIQE dataset labels
 - `add_set_column.py`: Add train/val/test splits
 - Various dataset-specific scripts (CSIQ, KADID-10k, KonIQ-10k, LIVE)
+
+### Model Weights
+
+Model weights should be placed in the gitignored directory @outputs/.
 
 ## Dataset Format
 

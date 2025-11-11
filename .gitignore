@@ -14,3 +14,6 @@ datasets/
 outputs/
 *.log
 *.png
+
+# `hf download` cache
+.cache/
