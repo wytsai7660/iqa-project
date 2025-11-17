@@ -63,7 +63,7 @@ class SimplifiedProgressCallback(TrainerCallback):
                         srcc_bar = '█' * int(srcc * 20) + '░' * (20 - int(srcc * 20))
                         print(f"  SRCC:       {srcc:.4f}  [{srcc_bar}]")
                 
-                print(f"======================================================================\n")
+                print(f"{'='*70}\n")
 
 
 class IQATrainer(Trainer):
@@ -87,7 +87,7 @@ class IQATrainer(Trainer):
         self.remove_callback(PrinterCallback)
         self.add_callback(SimplifiedProgressCallback)
     
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         """
         Compute loss for quality assessment task.
         
@@ -243,12 +243,45 @@ class IQATrainer(Trainer):
         # Compute aggregated metrics if we have predictions
         if len(self.eval_predictions) > 0:
             from src.new_train.metrics import compute_iqa_metrics
-            
+
             pred_scores = np.array(self.eval_predictions)
             gt_scores = np.array(self.eval_labels)
-            
+
             print(f"[DEBUG] Computing metrics: pred shape={pred_scores.shape}, gt shape={gt_scores.shape}")
-            
+
+            # Log prediction distribution statistics
+            pred_min = np.min(pred_scores)
+            pred_max = np.max(pred_scores)
+            pred_mean = np.mean(pred_scores)
+            pred_std = np.std(pred_scores)
+            pred_range = pred_max - pred_min
+
+            print(f"\n[PREDICTION STATS]")
+            print(f"  Min:   {pred_min:.4f}")
+            print(f"  Max:   {pred_max:.4f}")
+            print(f"  Mean:  {pred_mean:.4f}")
+            print(f"  Std:   {pred_std:.4f}")
+            print(f"  Range: {pred_range:.4f}")
+
+            # Also log ground truth distribution for comparison
+            gt_min = np.min(gt_scores)
+            gt_max = np.max(gt_scores)
+            gt_mean = np.mean(gt_scores)
+            gt_std = np.std(gt_scores)
+            print(f"\n[GROUND TRUTH STATS]")
+            print(f"  Min:   {gt_min:.4f}")
+            print(f"  Max:   {gt_max:.4f}")
+            print(f"  Mean:  {gt_mean:.4f}")
+            print(f"  Std:   {gt_std:.4f}")
+
+            # Warn if predictions are collapsing to a narrow range
+            if pred_range < 0.5:
+                print(f"\n⚠️  WARNING: Predictions collapsed to narrow range ({pred_range:.4f})!")
+                print(f"   This indicates the model is predicting similar scores for all images.")
+            elif pred_std < 0.2:
+                print(f"\n⚠️  WARNING: Low prediction variance (std={pred_std:.4f})!")
+                print(f"   The model may not be distinguishing quality differences well.")
+
             metrics = compute_iqa_metrics(pred_scores, gt_scores)
             
             print(f"[DEBUG] Computed metrics: {metrics}")

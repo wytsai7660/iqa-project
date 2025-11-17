@@ -17,3 +17,6 @@ outputs/
 
 # `hf download` cache
 .cache/
+
+# Jupyter Notebook output
+nb.log

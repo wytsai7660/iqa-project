@@ -23,6 +23,7 @@ dependencies = [
 dev = [
     "huggingface-hub[cli]>=0.35.3",
     "ipykernel>=7.0.1",
+    "notebook>=7.4.7",
     "scikit-learn>=1.7.2",
 ]
 
