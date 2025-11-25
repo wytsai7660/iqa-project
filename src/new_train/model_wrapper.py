@@ -32,8 +32,8 @@ class IQAModelWrapper(nn.Module):
         lora_target_modules: list = None,
         level_tokens: list = None,
         level_scores: list = None,
-        weight_ce: float = 1.0,
-        weight_kl: float = 0.05,
+        weight_ce: float = 0.05,  # γ (gamma) from DeQA-Score paper Eq. 9
+        weight_kl: float = 0.05,  # γ (gamma) from DeQA-Score paper Eq. 9
         weight_fidelity: float = 1.0,
         use_fix_std: bool = False,
         detach_pred_std: bool = False,
@@ -184,6 +184,12 @@ class IQAModelWrapper(nn.Module):
             # Normalize
             level_probs = level_probs / probs_sum.unsqueeze(1)
         
+        # Validate level_positions before using level_positions - 1
+        if (level_positions < 1).any():
+            print(f"[ERROR] level_positions contains values < 1: {level_positions}")
+            print(f"  Cannot use level_positions - 1 for indexing")
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
         # Extract logits at level token positions (previous position for next token prediction)
         level_logits = logits[torch.arange(batch_size), level_positions - 1]  # [batch_size, vocab_size]
         
@@ -228,7 +234,17 @@ class IQAModelWrapper(nn.Module):
             stds: Predicted standard deviations [batch_size]
         """
         batch_size = logits.shape[0]
-        
+
+        # Validate level_positions before using level_positions - 1
+        if (level_positions < 1).any():
+            print(f"[ERROR] level_positions contains values < 1: {level_positions}")
+            print(f"  Cannot use level_positions - 1 for indexing")
+            # Return neutral score (3.0) and zero std as fallback
+            return (
+                torch.full((batch_size,), 3.0, device=logits.device, dtype=logits.dtype),
+                torch.zeros(batch_size, device=logits.device, dtype=logits.dtype)
+            )
+
         # Extract logits at level token positions
         level_logits = logits[torch.arange(batch_size), level_positions - 1]  # [batch_size, vocab_size]
         
@@ -349,20 +365,21 @@ class IQAModelWrapper(nn.Module):
         Returns:
             Dictionary with 'loss', 'logits', 'loss_ce', 'loss_kl'
         """
-        # Prepare inputs
+        # Prepare inputs - call model WITHOUT labels to get raw logits
+        # We'll manually compute CE loss to exclude quality tokens
         if pixel_values is not None:
             # When we have images, media_offset must be provided
             if media_offset is None:
                 # Default: assume each sample has one image at the beginning
                 batch_size = pixel_values.shape[0]
                 media_offset = [[0]] * batch_size
-            
+
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 pixel_values=pixel_values,
                 media_offset=media_offset,
-                labels=labels,
+                labels=None,  # Don't pass labels - we'll compute loss manually
                 return_dict=True,
             )
         else:
@@ -373,25 +390,56 @@ class IQAModelWrapper(nn.Module):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 media_offset=media_offset,
-                labels=labels,
+                labels=None,  # Don't pass labels - we'll compute loss manually
                 return_dict=True,
             )
-        
-        loss_ce = outputs.loss if outputs.loss is not None else 0
+
         logits = outputs.logits
-        
-        # Compute KL loss for level token
-        loss_kl = 0
+
+        # Find quality token positions if this is a quality prediction task
+        level_positions = None
         if level_probs is not None and labels is not None:
-            level_positions = self.find_level_token_position(labels)
-            if level_positions is not None:
-                valid_mask = level_positions >= 0
-                if valid_mask.any():
-                    loss_kl = self.compute_kl_loss(
-                        logits[valid_mask],
-                        level_probs[valid_mask],
-                        level_positions[valid_mask],
-                    )
+            level_positions = self.find_level_token_position(input_ids)
+
+        # Compute CE loss, excluding quality tokens if present
+        loss_ce = 0
+        if labels is not None:
+            # DeQA-Score approach: exclude quality token from CE loss
+            # Quality token is ONLY supervised by KL loss, not CE loss
+            # We do this by setting labels[level_position] = -100 (mask token)
+            # This preserves sequence alignment unlike removing elements!
+
+            # Create a copy of labels to avoid modifying the original
+            labels_for_ce = labels.clone()
+
+            if level_positions is not None and (level_positions >= 0).any():
+                # Mask out quality token positions (set to -100 so CE loss ignores them)
+                batch_size = labels.shape[0]
+                for batch_idx in range(batch_size):
+                    if level_positions[batch_idx] >= 0:
+                        # Mask the quality token position
+                        labels_for_ce[batch_idx, level_positions[batch_idx]] = -100
+
+            # Compute CE loss on all tokens (quality positions now masked with -100)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels_for_ce[..., 1:].contiguous()
+
+            loss_fct = nn.CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+            shift_labels = shift_labels.view(-1)
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss_ce = loss_fct(shift_logits, shift_labels)
+
+        # Compute KL loss for quality tokens
+        loss_kl = 0
+        if level_probs is not None and level_positions is not None:
+            valid_mask = level_positions >= 0
+            if valid_mask.any():
+                loss_kl = self.compute_kl_loss(
+                    logits[valid_mask],
+                    level_probs[valid_mask],
+                    level_positions[valid_mask],
+                )
         
         # Total loss
         total_loss = self.weight_ce * loss_ce + self.weight_kl * loss_kl
@@ -497,32 +545,42 @@ class IQAModelWrapper(nn.Module):
             # Get predicted scores for fidelity loss
             level_positions_A = self.find_level_token_position(input_ids_quality_A)
             level_positions_B = self.find_level_token_position(input_ids_quality_B)
-            
-            pred_scores_A, pred_stds_A = self.get_predicted_scores_and_stds(
-                outputs_quality_A["logits"], level_positions_A
-            )
-            pred_scores_B, pred_stds_B = self.get_predicted_scores_and_stds(
-                outputs_quality_B["logits"], level_positions_B
-            )
-            
-            # Compute fidelity loss
-            if gt_stds_A is not None and gt_stds_B is not None:
-                loss_fidelity = self.compute_fidelity_loss(
-                    pred_scores_A, pred_stds_A, gt_scores_A, gt_stds_A,
-                    pred_scores_B, pred_stds_B, gt_scores_B, gt_stds_B,
-                )
+
+            # Validate that level positions were found
+            if level_positions_A is None or level_positions_B is None:
+                print("[ERROR] Could not find level token positions for quality prediction")
+                print(f"  level_positions_A: {level_positions_A}")
+                print(f"  level_positions_B: {level_positions_B}")
+                # Skip fidelity loss computation, only use CE + KL losses
+                total_loss += outputs_quality_A["loss"] + outputs_quality_B["loss"]
+                loss_ce_total += outputs_quality_A["loss_ce"] + outputs_quality_B["loss_ce"]
+                loss_kl_total += outputs_quality_A["loss_kl"] + outputs_quality_B["loss_kl"]
             else:
-                loss_fidelity = self.compute_binary_fidelity_loss(
-                    pred_scores_A, gt_scores_A, pred_scores_B, gt_scores_B
+                pred_scores_A, pred_stds_A = self.get_predicted_scores_and_stds(
+                    outputs_quality_A["logits"], level_positions_A
                 )
-            
-            # Add quality task losses
-            total_loss += outputs_quality_A["loss"] + outputs_quality_B["loss"]
-            loss_ce_total += outputs_quality_A["loss_ce"] + outputs_quality_B["loss_ce"]
-            loss_kl_total += outputs_quality_A["loss_kl"] + outputs_quality_B["loss_kl"]
-            
-            # Add fidelity loss
-            total_loss += self.weight_fidelity * loss_fidelity
+                pred_scores_B, pred_stds_B = self.get_predicted_scores_and_stds(
+                    outputs_quality_B["logits"], level_positions_B
+                )
+
+                # Compute fidelity loss
+                if gt_stds_A is not None and gt_stds_B is not None:
+                    loss_fidelity = self.compute_fidelity_loss(
+                        pred_scores_A, pred_stds_A, gt_scores_A, gt_stds_A,
+                        pred_scores_B, pred_stds_B, gt_scores_B, gt_stds_B,
+                    )
+                else:
+                    loss_fidelity = self.compute_binary_fidelity_loss(
+                        pred_scores_A, gt_scores_A, pred_scores_B, gt_scores_B
+                    )
+
+                # Add quality task losses (summed from A and B to balance with fidelity)
+                total_loss += outputs_quality_A["loss"] + outputs_quality_B["loss"]
+                loss_ce_total += outputs_quality_A["loss_ce"] + outputs_quality_B["loss_ce"]
+                loss_kl_total += outputs_quality_A["loss_kl"] + outputs_quality_B["loss_kl"]
+
+                # Add fidelity loss
+                total_loss += self.weight_fidelity * loss_fidelity
             
             # Include logits for validation metric computation (from quality task)
             logits = outputs_quality_A["logits"]

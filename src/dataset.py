@@ -154,36 +154,66 @@ class PairDataset(Dataset[PairDatasetItem]):
 
     @staticmethod
     def get_level_probabilities(mos: float, stddev: float) -> ndarray:
+        """
+        Compute soft label probabilities for quality levels using DeQA-Score post-adjustment.
+
+        This function converts a MOS (Mean Opinion Score) and standard deviation into
+        a probability distribution over 5 quality levels: [bad, low, fair, good, awesome]
+        corresponding to scores [1, 2, 3, 4, 5].
+
+        Process:
+        1. Compute raw probabilities using Gaussian CDF
+        2. Apply post-adjustment formula (DeQA-Score paper, page 4) to ensure
+           the expected value of the distribution equals the original MOS
+        3. Clip and normalize to ensure valid probability distribution
+
+        Args:
+            mos: Mean Opinion Score (normalized, typically 1-5 scale)
+            stddev: Standard deviation of the MOS
+
+        Returns:
+            Array of 5 probabilities summing to 1.0
+
+        Note: When the post-adjustment denominator is too small (< 1e-6), we fall back
+        to normalized raw probabilities to avoid numerical instability. This typically
+        happens when MOS is very close to 3.0 and creates minimal difference from the
+        adjusted formula.
+        """
+        # Step 1: Compute raw probabilities from Gaussian distribution
+        # The CDF is evaluated at boundaries between quality levels
         cdf_points = array([0.5, 1.5, 2.5, 3.5, 4.5, 5.5])
         cdf_values = norm.cdf(cdf_points, loc=mos, scale=stddev) # pyright: ignore[reportUnknownMemberType]
-        p_raw = diff(cdf_values)
-        # Taken from 4th page of DeQA-Score, Post-adjustment section
+        p_raw = diff(cdf_values)  # Probabilities for each level
+
+        # Step 2: Post-adjustment to preserve MOS (DeQA-Score paper, page 4)
         p_raw_sum = p_raw.sum()
-        mu_rec = inner(array([1, 2, 3, 4, 5]), p_raw)
-        
-        # Safe division with larger epsilon to avoid NaN
+        mu_rec = inner(array([1, 2, 3, 4, 5]), p_raw)  # Expected value of raw distribution
+
+        # Compute adjustment parameters alpha and beta
         denominator = mu_rec - 3 * p_raw_sum
-        if abs(denominator) < 1e-6:  # Increased from 1e-9
-            # Fallback to simple normalization if denominator is too small
+        if abs(denominator) < 1e-6:
+            # Fallback: When denominator is too small, skip adjustment
+            # This prevents numerical instability and typically occurs when MOS ≈ 3.0
             alpha = 1.0
             beta = 0.0
         else:
+            # Standard post-adjustment formula
             alpha = (mos - 3) / denominator
             beta = (1 - alpha * p_raw_sum) / 5
-        
+
         probs = p_raw * alpha + beta
-        
-        # Ensure probabilities are valid
-        probs = np.clip(probs, 0.0, 1.0)
-        
+
+        # Step 3: Ensure valid probability distribution
+        probs = np.clip(probs, 0.0, 1.0)  # Clip to valid range
+
         # Normalize to sum to 1
         probs_sum = probs.sum()
         if probs_sum > 0:
             probs = probs / probs_sum
         else:
-            # Fallback: uniform distribution
+            # Edge case fallback: if all probs are 0, use uniform distribution
             probs = np.ones(5) / 5
-        
+
         return probs
 
     def get_one_image(self, dataset_index: int, image_index: int) -> PairDatasetImage:
@@ -234,7 +264,7 @@ class PairDataset(Dataset[PairDatasetItem]):
         quality_qa = [
             {
                 "role": "user",
-                "content": f"{choice(possible_quality_questions)}"
+                "content": "What do you think about the quality of this image?"  # Fixed question for consistent training
             },
             {
                 "role": "assistant",
@@ -272,10 +302,77 @@ class PairDataset(Dataset[PairDatasetItem]):
             "distortion_type_message": self.processor(images=[image], messages=deepcopy(distortion_type_message)),
             "scene_type_message": self.processor(images=[image], messages=deepcopy(scene_type_message)),
             "level_probabilities": level_probabilities,
+            "mos_normalized": mos,  # Original normalized MOS for ground truth
+            "stddev_normalized": stddev,  # Original normalized stddev for ground truth
         }
     
     def __len__(self) -> int:
         return self.cumulative_dataset_image_counts[-1]
+
+    def get_sample_weights(
+        self,
+        num_bins: int = 5,
+        bin_edges: list[float] | None = None
+    ) -> ndarray:
+        """
+        Compute sample weights for weighted sampling to address MOS distribution imbalance.
+
+        Samples in underrepresented MOS bins receive higher weights so they are sampled
+        more frequently during training. This helps the model learn to predict extreme
+        (low and high) quality scores better.
+
+        Args:
+            num_bins: Number of bins to divide the MOS range into (default: 5, matching quality levels)
+            bin_edges: Custom bin edges. If None, uses [0.5, 1.5, 2.5, 3.5, 4.5, 5.5] for 5 bins
+                       (matching the quality token boundaries: bad, low, fair, good, awesome).
+                       Note: mos_normalized is always in [1, 5] range.
+
+        Returns:
+            Array of weights, one per sample. Weights are normalized so they sum to len(dataset).
+
+        Example:
+            If bin counts are [41, 923, 3763, 2331, 0] (KonIQ-10k training set):
+            - Bin 0 (bad): 41 samples → weight ≈ 172 (high weight, underrepresented)
+            - Bin 1 (low): 923 samples → weight ≈ 7.6
+            - Bin 2 (fair): 3763 samples → weight ≈ 1.9 (low weight, overrepresented)
+            - Bin 3 (good): 2331 samples → weight ≈ 3.0
+            - Bin 4 (awesome): 0 samples → N/A
+        """
+        if bin_edges is None:
+            # Use quality token boundaries for normalized MOS in [1, 5]:
+            # bad(1-1.5), low(1.5-2.5), fair(2.5-3.5), good(3.5-4.5), awesome(4.5-5.5)
+            # 0.5 lower bound catches any edge cases below 1.0
+            bin_edges = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
+
+        all_weights = []
+
+        for dataset_index, data_frame in enumerate(self.dataset_labels_data_frames):
+            mos_values = data_frame["mos_normalized"].values
+
+            # Assign each sample to a bin
+            bin_indices = np.digitize(mos_values, bin_edges) - 1  # -1 to make 0-indexed
+            bin_indices = np.clip(bin_indices, 0, len(bin_edges) - 2)  # Ensure valid bin indices
+
+            # Count samples in each bin
+            bin_counts = np.bincount(bin_indices, minlength=len(bin_edges) - 1)
+
+            # Compute inverse frequency weights (avoid division by zero)
+            bin_weights = np.zeros_like(bin_counts, dtype=float)
+            non_empty_bins = bin_counts > 0
+            bin_weights[non_empty_bins] = 1.0 / bin_counts[non_empty_bins]
+
+            # Assign weight to each sample based on its bin
+            sample_weights = bin_weights[bin_indices]
+            all_weights.append(sample_weights)
+
+        # Concatenate weights from all datasets
+        weights = np.concatenate(all_weights)
+
+        # Normalize weights so they sum to the dataset size
+        # This ensures the effective epoch size stays the same
+        weights = weights * len(weights) / weights.sum()
+
+        return weights
 
 
 def collate_fn(batch):

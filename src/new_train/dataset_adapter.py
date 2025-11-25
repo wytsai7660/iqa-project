@@ -48,27 +48,32 @@ class IQAPairDataset(Dataset):
     
     def __len__(self):
         return len(self.pair_dataset)
-    
+
+    def get_sample_weights(self) -> np.ndarray:
+        """
+        Get sample weights for weighted sampling based on MOS distribution.
+        Delegates to the underlying PairDataset.
+
+        Returns:
+            Array of weights, one per sample.
+        """
+        return self.pair_dataset.get_sample_weights()
+
     def __getitem__(self, idx):
         pair_item = self.pair_dataset[idx]
         
         image_A = pair_item["image_1"]
         image_B = pair_item["image_2"]
-        
-        # Compute scores and stds from level probabilities
-        level_scores = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        
+
+        # Use original normalized MOS and stddev for ground truth
+        # (Previously computed from soft labels, which could introduce bias)
         level_probs_A = image_A["level_probabilities"]
-        gt_score_A = float(np.sum(level_probs_A * level_scores))
-        # Add small epsilon to avoid sqrt of negative or zero values
-        variance_A = np.sum(level_probs_A * (level_scores - gt_score_A) ** 2)
-        gt_std_A = float(np.sqrt(max(variance_A, 0.0) + 1e-8))
-        
+        gt_score_A = float(image_A["mos_normalized"])
+        gt_std_A = float(image_A["stddev_normalized"])
+
         level_probs_B = image_B["level_probabilities"]
-        gt_score_B = float(np.sum(level_probs_B * level_scores))
-        # Add small epsilon to avoid sqrt of negative or zero values
-        variance_B = np.sum(level_probs_B * (level_scores - gt_score_B) ** 2)
-        gt_std_B = float(np.sqrt(max(variance_B, 0.0) + 1e-8))
+        gt_score_B = float(image_B["mos_normalized"])
+        gt_std_B = float(image_B["stddev_normalized"])
         
         # Extract quality task data (main task with KL loss and fidelity loss)
         quality_messages_A = image_A["quality_message"]

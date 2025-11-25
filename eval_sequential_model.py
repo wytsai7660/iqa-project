@@ -81,7 +81,6 @@ def evaluate_one_image_sequential(
     
     # === Step 1: Ask scene question ===
     scene_messages = [
-        {"role": "system", "content": ""},
         {"role": "user", "content": "<|image|>\n"},
         {"role": "user", "content": "What is the scene type of this image?"},
     ]
@@ -125,7 +124,6 @@ def evaluate_one_image_sequential(
     
     # === Step 2: Ask distortion question (with scene answer context) ===
     distortion_messages = [
-        {"role": "system", "content": ""},
         {"role": "user", "content": "<|image|>\n"},
         {"role": "user", "content": "What is the scene type of this image?"},
         {"role": "assistant", "content": scene_response},
@@ -169,7 +167,6 @@ def evaluate_one_image_sequential(
     
     # === Step 3: Ask quality question (with scene+distortion answer context) ===
     quality_messages = [
-        {"role": "system", "content": ""},
         {"role": "user", "content": "<|image|>\n"},
         {"role": "user", "content": "What is the scene type of this image?"},
         {"role": "assistant", "content": scene_response},
@@ -182,7 +179,7 @@ def evaluate_one_image_sequential(
     quality_text = tokenizer.apply_chat_template(
         quality_messages,
         tokenize=False,
-        add_generation_prompt=False  # Already has assistant prefix
+        continue_final_message=True,  # Don't add <|im_end|> so model continues from "is "
     )
     
     quality_encoding = tokenizer(
@@ -316,11 +313,11 @@ def evaluate_model(model, dataset, device="cuda", tokenizer=None, processor=None
                 
                 # Get preprocessed data
                 pixel_values_A = item['pixel_values_A'].unsqueeze(0).to(device)
-                media_offset_A = item['media_offset_A'].unsqueeze(0).to(device)
+                media_offset_A = [item['media_offset_A']]  # Wrap in list for batch format
                 gt_quality_A = item['gt_scores_A']  # Ground truth MOS
-                
+
                 pixel_values_B = item['pixel_values_B'].unsqueeze(0).to(device)
-                media_offset_B = item['media_offset_B'].unsqueeze(0).to(device)
+                media_offset_B = [item['media_offset_B']]  # Wrap in list for batch format
                 gt_quality_B = item['gt_scores_B']
                 
                 # Evaluate image A
@@ -516,7 +513,7 @@ def main():
             model.level_token_sequences.append(token_ids)
         
         # Loss weights (not used for evaluation but needed for compatibility)
-        model.weight_ce = 1.0
+        model.weight_ce = 0.05
         model.weight_kl = 0.05
         model.weight_fidelity = 1.0
         model.use_fix_std = False
@@ -568,7 +565,7 @@ def main():
     metrics = compute_metrics(all_predictions, all_gt)
     
     print(f"\n📊 Overall Performance (Sequential Q&A):")
-    print(f"  Samples:    {len(all_predictions)}")
+    print(f"  Samples:    {len(dataset)}")
     print(f"  PLCC:       {metrics['plcc']:.4f}  {'█' * int(metrics['plcc'] * 20)}")
     print(f"  SRCC:       {metrics['srcc']:.4f}  {'█' * int(metrics['srcc'] * 20)}")
     print(f"  MAE:        {metrics['mae']:.4f}")
@@ -576,7 +573,7 @@ def main():
     
     # Plot scatter plot: GT vs Predicted Quality
     print("\n📈 Generating scatter plot...")
-    output_plot_path = Path(args.model_path) / "eval_scatter_plot.png"
+    output_plot_path = Path(args.model_path) / f"eval_scatter_plot_{"_".join([Path(p).name for p in args.dataset_paths])}_{args.split}.png"
     
     plt.figure(figsize=(10, 10))
     plt.scatter(all_gt, all_predictions, alpha=0.5, s=20, edgecolors='none')

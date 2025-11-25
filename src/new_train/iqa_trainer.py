@@ -9,6 +9,11 @@ from transformers import Trainer
 from transformers.trainer_callback import TrainerCallback, PrinterCallback
 import torch
 import numpy as np
+from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+from scipy import stats
 
 
 class SimplifiedProgressCallback(TrainerCallback):
@@ -70,22 +75,96 @@ class IQATrainer(Trainer):
     """
     Custom Trainer that ensures eval_loss is properly logged and handles
     evaluation in a memory-efficient way by computing metrics on-the-fly.
+
+    Also ensures that only LoRA adapters are saved during checkpointing.
+    Supports weighted sampling to address MOS distribution imbalance.
+    Generates scatter plots during evaluation to visualize predictions vs ground truth.
     """
-    
-    def __init__(self, *args, **kwargs):
+
+    def __init__(self, *args, use_weighted_sampling: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         # Store references for metric computation
         self.eval_predictions = []
         self.eval_labels = []
-        
+
         # Store loss components for detailed logging
         self.eval_loss_ce_list = []
         self.eval_loss_kl_list = []
         self.eval_loss_fidelity_list = []
-        
+
+        # Weighted sampling configuration
+        self.use_weighted_sampling = use_weighted_sampling
+
         # Remove default PrinterCallback and add our simplified one
         self.remove_callback(PrinterCallback)
         self.add_callback(SimplifiedProgressCallback)
+
+    def get_train_dataloader(self):
+        """
+        Override to support weighted sampling based on MOS distribution.
+
+        When use_weighted_sampling is True, uses WeightedRandomSampler to oversample
+        images from underrepresented MOS bins (e.g., low-quality images).
+        """
+        from torch.utils.data import DataLoader, WeightedRandomSampler
+        from transformers.trainer_utils import seed_worker
+
+        if not self.use_weighted_sampling:
+            return super().get_train_dataloader()
+
+        # Check if dataset supports weighted sampling
+        if not hasattr(self.train_dataset, 'get_sample_weights'):
+            print("⚠️  Warning: Dataset does not support get_sample_weights(), using default sampling")
+            return super().get_train_dataloader()
+
+        # Get sample weights from dataset
+        sample_weights = self.train_dataset.get_sample_weights()
+        print(f"📊 Using weighted sampling with {len(sample_weights)} samples")
+        print(f"   Weight range: [{sample_weights.min():.4f}, {sample_weights.max():.4f}]")
+
+        # Create weighted sampler
+        weighted_sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(sample_weights).double(),
+            num_samples=len(self.train_dataset),
+            replacement=True,
+        )
+
+        # Create DataLoader with explicit arguments from TrainingArguments
+        return DataLoader(
+            dataset=self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            sampler=weighted_sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            drop_last=self.args.dataloader_drop_last,
+            worker_init_fn=seed_worker,
+            persistent_workers=self.args.dataloader_persistent_workers,
+            prefetch_factor=self.args.dataloader_prefetch_factor,
+        )
+
+    def _save(self, output_dir=None, state_dict=None):
+        """
+        Override _save to only save LoRA adapters, not the full model.
+
+        This ensures that checkpoint saves during training (every save_steps)
+        only save the small adapter weights (~100MB) instead of the full model (~15GB).
+        """
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save the PEFT model (LoRA adapters only)
+        # The model is IQAModelWrapper.model, which is a PeftModel
+        if hasattr(self.model, 'model'):
+            # IQAModelWrapper wraps the PEFT model in self.model
+            self.model.model.save_pretrained(output_dir)
+        else:
+            # Fallback to default behavior if model structure is different
+            super()._save(output_dir, state_dict)
+
+        # Save tokenizer for convenience
+        if hasattr(self.model, 'tokenizer'):
+            self.model.tokenizer.save_pretrained(output_dir)
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         """
@@ -295,11 +374,75 @@ class IQATrainer(Trainer):
                     output.metrics[k] = v
                 print(f"[DEBUG] Added metrics to output.metrics: {list(self.eval_iqa_metrics.keys())}")
         
+        # Generate scatter plot before clearing predictions
+        if len(self.eval_predictions) > 0:
+            self._generate_eval_scatter_plot(
+                pred_scores=np.array(self.eval_predictions),
+                gt_scores=np.array(self.eval_labels),
+                step=self.state.global_step,
+                metrics=output.metrics,
+            )
+
         # Clear accumulators
         self.eval_predictions = []
         self.eval_labels = []
         self.eval_loss_ce_list = []
         self.eval_loss_kl_list = []
         self.eval_loss_fidelity_list = []
-        
+
         return output
+
+    def _generate_eval_scatter_plot(
+        self,
+        pred_scores: np.ndarray,
+        gt_scores: np.ndarray,
+        step: int,
+        metrics: dict | None = None,
+    ):
+        """
+        Generate and save a scatter plot of predictions vs ground truth.
+
+        Args:
+            pred_scores: Predicted quality scores [N]
+            gt_scores: Ground truth quality scores [N]
+            step: Current training step
+            metrics: Optional dict with PLCC/SRCC metrics
+        """
+        try:
+            # Create eval_plots directory under output_dir
+            plot_dir = Path(self.args.output_dir) / "eval_plots"
+            plot_dir.mkdir(parents=True, exist_ok=True)
+
+            plcc = metrics.get("eval_plcc", 0.0) if metrics else 0.0
+            srcc = metrics.get("eval_srcc", 0.0) if metrics else 0.0
+
+            fig, ax = plt.subplots(figsize=(8, 8))
+
+            # Scatter plot
+            ax.scatter(gt_scores, pred_scores, alpha=0.5, s=20, edgecolors='none')
+
+            # Perfect prediction line
+            min_val = min(gt_scores.min(), pred_scores.min())
+            max_val = max(gt_scores.max(), pred_scores.max())
+            ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='Perfect Prediction')
+
+            # Labels and title
+            ax.set_xlabel('Ground Truth Quality Score', fontsize=12)
+            ax.set_ylabel('Predicted Quality Score', fontsize=12)
+            ax.set_title(f'Step {step}: PLCC={plcc:.4f}, SRCC={srcc:.4f}', fontsize=14)
+            ax.legend(fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+            # Set consistent axis limits
+            ax.set_xlim(0.5, 5.5)
+            ax.set_ylim(0.5, 5.5)
+
+            # Save figure
+            plot_path = plot_dir / f"step_{step:06d}.png"
+            fig.savefig(plot_path, dpi=100, bbox_inches='tight')
+            plt.close(fig)
+
+            print(f"📈 Saved evaluation plot to: {plot_path}")
+
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to generate evaluation plot: {e}")
