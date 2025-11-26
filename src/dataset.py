@@ -162,10 +162,12 @@ class PairDataset(Dataset[PairDatasetItem]):
         corresponding to scores [1, 2, 3, 4, 5].
 
         Process:
-        1. Compute raw probabilities using Gaussian CDF
-        2. Apply post-adjustment formula (DeQA-Score paper, page 4) to ensure
+        1. Handle edge case: if stddev is very small (< 0.2), use linear interpolation
+           between the two nearest quality levels (DeQA-Score paper, Appendix B.1, page 13)
+        2. Compute raw probabilities using Gaussian CDF
+        3. Apply post-adjustment formula (DeQA-Score paper, page 4) to ensure
            the expected value of the distribution equals the original MOS
-        3. Clip and normalize to ensure valid probability distribution
+        4. Clip and normalize to ensure valid probability distribution
 
         Args:
             mos: Mean Opinion Score (normalized, typically 1-5 scale)
@@ -179,6 +181,45 @@ class PairDataset(Dataset[PairDatasetItem]):
         happens when MOS is very close to 3.0 and creates minimal difference from the
         adjusted formula.
         """
+        # Step 0: Handle very small variance using linear interpolation (DeQA-Score Appendix B.1)
+        # When variance is extremely small, the Gaussian distribution approximates a delta function
+        # Using scipy's norm.cdf with scale ≈ 0 causes division by zero
+        # Solution: linear interpolation between the two nearest quality level centers
+        # Threshold: σ² < 0.04 (i.e., σ < 0.2), based on 3σ rule from DeQA-Score paper
+        if stddev < 0.2:
+            # Quality level centers are at [1, 2, 3, 4, 5]
+            # Find the two nearest centers: c_j and c_{j+1} where c_j < mos <= c_{j+1}
+            # Linear interpolation: p_j = c_{j+1} - mos, p_{j+1} = mos - c_j
+
+            # Clamp mos to valid range [1, 5]
+            mos_clamped = np.clip(mos, 1.0, 5.0)
+
+            # Find j such that c_j < mos <= c_{j+1}
+            # Centers are [1, 2, 3, 4, 5], so j = floor(mos - 1), clamped to [0, 3]
+            j = int(np.clip(np.floor(mos_clamped - 1.0), 0, 3))
+
+            # c_j = j + 1, c_{j+1} = j + 2
+            c_j = j + 1.0
+            c_j_plus_1 = j + 2.0
+
+            # Initialize probabilities to zero
+            probs = np.zeros(5)
+
+            # Linear interpolation
+            probs[j] = c_j_plus_1 - mos_clamped      # p_j = c_{j+1} - mos
+            probs[j + 1] = mos_clamped - c_j          # p_{j+1} = mos - c_j
+
+            # Ensure valid probabilities and normalization
+            probs = np.clip(probs, 0.0, 1.0)
+            probs_sum = probs.sum()
+            if probs_sum > 0:
+                probs = probs / probs_sum
+            else:
+                # Fallback: uniform distribution (should never happen)
+                probs = np.ones(5) / 5
+
+            return probs
+
         # Step 1: Compute raw probabilities from Gaussian distribution
         # The CDF is evaluated at boundaries between quality levels
         cdf_points = array([0.5, 1.5, 2.5, 3.5, 4.5, 5.5])
@@ -339,10 +380,9 @@ class PairDataset(Dataset[PairDatasetItem]):
             - Bin 4 (awesome): 0 samples → N/A
         """
         if bin_edges is None:
-            # Use quality token boundaries for normalized MOS in [1, 5]:
-            # bad(1-1.5), low(1.5-2.5), fair(2.5-3.5), good(3.5-4.5), awesome(4.5-5.5)
-            # 0.5 lower bound catches any edge cases below 1.0
-            bin_edges = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
+            # Use quality token boundaries for normalized MOS in [1, 5]
+            # 0.9 lower bound catches any edge cases below 1.0
+            bin_edges = [0.9, 2, 3, 4, 5.1]
 
         all_weights = []
 

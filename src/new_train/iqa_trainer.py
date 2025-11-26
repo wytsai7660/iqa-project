@@ -29,7 +29,8 @@ class SimplifiedProgressCallback(TrainerCallback):
             # Show evaluation metrics when available
             elif 'eval_loss' in logs:
                 print(f"\n{'='*70}")
-                print(f"📊 Validation Results at Epoch {logs.get('epoch', 0):.2f}")
+                eval_mode = "Generated Context" if hasattr(self, 'trainer') and getattr(self.trainer, 'use_generated_context', False) else "GT Context (Teacher Forcing)"
+                print(f"📊 Validation Results at Epoch {logs.get('epoch', 0):.2f} [{eval_mode}]")
                 print(f"{'='*70}")
                 
                 # Total Loss
@@ -79,9 +80,12 @@ class IQATrainer(Trainer):
     Also ensures that only LoRA adapters are saved during checkpointing.
     Supports weighted sampling to address MOS distribution imbalance.
     Generates scatter plots during evaluation to visualize predictions vs ground truth.
+
+    IMPORTANT: During evaluation, uses TRUE sequential generation (no teacher forcing)
+    to match test-time behavior.
     """
 
-    def __init__(self, *args, use_weighted_sampling: bool = False, **kwargs):
+    def __init__(self, *args, use_weighted_sampling: bool = False, use_generated_context: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         # Store references for metric computation
         self.eval_predictions = []
@@ -94,6 +98,9 @@ class IQATrainer(Trainer):
 
         # Weighted sampling configuration
         self.use_weighted_sampling = use_weighted_sampling
+
+        # Use generated context during evaluation (no teacher forcing)
+        self.use_generated_context = use_generated_context
 
         # Remove default PrinterCallback and add our simplified one
         self.remove_callback(PrinterCallback)
@@ -204,23 +211,32 @@ class IQATrainer(Trainer):
         ignore_keys=None,
     ):
         """
-        Override prediction_step to compute metrics on-the-fly without storing all logits.
+        Override prediction_step to use TRUE sequential generation during evaluation.
+
+        If use_generated_context=True:
+            - Generates scene answer
+            - Generates distortion answer (using generated scene)
+            - Predicts quality (using generated scene + distortion)
+
+        If use_generated_context=False (old behavior):
+            - Uses ground truth context (teacher forcing)
         """
         has_labels = all(inputs.get(k) is not None for k in self.label_names)
-        
+
         inputs = self._prepare_inputs(inputs)
-        
+
         with torch.no_grad():
             if has_labels:
+                # Always compute loss for logging
                 loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
                 loss = loss.mean().detach()
-                
+
                 # Store loss components for detailed logging
                 if isinstance(outputs, dict):
                     loss_ce = outputs.get("loss_ce", torch.tensor(0.0))
                     loss_kl = outputs.get("loss_kl", torch.tensor(0.0))
                     loss_fidelity = outputs.get("loss_fidelity", torch.tensor(0.0))
-                    
+
                     # Convert to float and store
                     if isinstance(loss_ce, torch.Tensor):
                         self.eval_loss_ce_list.append(loss_ce.item())
@@ -228,59 +244,209 @@ class IQATrainer(Trainer):
                         self.eval_loss_kl_list.append(loss_kl.item())
                     if isinstance(loss_fidelity, torch.Tensor):
                         self.eval_loss_fidelity_list.append(loss_fidelity.item())
-                
-                # Extract logits for this batch only
-                if isinstance(outputs, dict):
-                    logits = outputs.get("logits")
+
+                # Compute predictions using sequential generation (if enabled)
+                if self.use_generated_context:
+                    # Use TRUE sequential generation (like eval_sequential_model.py)
+                    pred_scores, gt_scores = self._evaluate_with_generated_context(model, inputs)
+
+                    if len(pred_scores) > 0:
+                        self.eval_predictions.extend(pred_scores)
+                        self.eval_labels.extend(gt_scores)
                 else:
-                    logits = outputs[1] if isinstance(outputs, tuple) and len(outputs) > 1 else None
-                
-                # Always compute metrics during evaluation (ignore prediction_loss_only flag)
-                # We need to extract quality scores to compute PLCC/SRCC
-                if logits is not None:
-                    # For pair dataset, extract quality scores from image A
-                    # Use input_ids_quality_A to find level positions (not labels, which has -100 padding)
-                    input_ids_quality_A = inputs.get("input_ids_quality_A")
-                    labels_quality_A = inputs.get("labels_quality_A")
-                    
-                    if input_ids_quality_A is not None and labels_quality_A is not None:
-                        # Find level token positions in input_ids_quality_A
-                        level_positions = self.model.find_level_token_position(input_ids_quality_A)
-                        if level_positions is not None and (level_positions >= 0).any():
-                            # Compute predicted scores for this batch
-                            from src.new_train.metrics import compute_quality_score_from_logits
-                            valid_mask = level_positions >= 0
-                            
-                            if valid_mask.any():
-                                pred_scores = compute_quality_score_from_logits(
-                                    logits[valid_mask],
-                                    level_positions[valid_mask],
-                                    self.model.level_token_sequences,
-                                )
-                                
-                                # Extract ground truth scores from gt_scores_A (if available)
-                                gt_scores_A = inputs.get("gt_scores_A")
-                                if gt_scores_A is not None:
-                                    # Use the provided ground truth scores
-                                    gt_scores = gt_scores_A[valid_mask]
-                                    # Store for later aggregation
-                                    self.eval_predictions.extend(pred_scores.cpu().numpy().tolist())
-                                    self.eval_labels.extend(gt_scores.cpu().numpy().tolist())
-                        else:
-                            # Debug: why no level positions found?
-                            if level_positions is None:
-                                print("[DEBUG] level_positions is None")
-                            elif not (level_positions >= 0).any():
-                                print(f"[DEBUG] No valid level positions found: {level_positions}")
+                    # Old behavior: use teacher forcing (GT context)
+                    # Extract logits from the quality forward pass
+                    if isinstance(outputs, dict):
+                        logits = outputs.get("logits")
                     else:
-                        print("[DEBUG] No input_ids_quality_A or labels_quality_A in inputs")
-                else:
-                    print("[DEBUG] No logits in outputs")
+                        logits = outputs[1] if isinstance(outputs, tuple) and len(outputs) > 1 else None
+
+                    if logits is not None:
+                        # For pair dataset, extract quality scores from image A
+                        input_ids_quality_A = inputs.get("input_ids_quality_A")
+                        labels_quality_A = inputs.get("labels_quality_A")
+
+                        if input_ids_quality_A is not None and labels_quality_A is not None:
+                            # Find level token positions in input_ids_quality_A
+                            level_positions = self.model.find_level_token_position(input_ids_quality_A)
+                            if level_positions is not None and (level_positions >= 0).any():
+                                # Compute predicted scores for this batch
+                                from src.new_train.metrics import compute_quality_score_from_logits
+                                valid_mask = level_positions >= 0
+
+                                if valid_mask.any():
+                                    pred_scores = compute_quality_score_from_logits(
+                                        logits[valid_mask],
+                                        level_positions[valid_mask],
+                                        self.model.level_token_sequences,
+                                    )
+
+                                    # Extract ground truth scores from gt_scores_A (if available)
+                                    gt_scores_A = inputs.get("gt_scores_A")
+                                    if gt_scores_A is not None:
+                                        # Use the provided ground truth scores
+                                        gt_scores = gt_scores_A[valid_mask]
+                                        # Store for later aggregation
+                                        self.eval_predictions.extend(pred_scores.cpu().numpy().tolist())
+                                        self.eval_labels.extend(gt_scores.cpu().numpy().tolist())
             else:
                 loss = None
-        
+
         # Always return (loss, None, None) to avoid storing logits
         return (loss, None, None)
+
+    def _evaluate_with_generated_context(self, model, inputs):
+        """
+        Evaluate using TRUE sequential generation (no teacher forcing).
+
+        Process:
+        1. Generate scene answer
+        2. Generate distortion answer (using generated scene as context)
+        3. Predict quality (using generated scene + distortion as context)
+
+        Returns:
+            pred_scores: List of predicted quality scores
+            gt_scores: List of ground truth quality scores
+        """
+        import torch.nn.functional as F
+
+        pred_scores = []
+        gt_scores = []
+
+        # Get batch size
+        batch_size = inputs["pixel_values_A"].shape[0]
+
+        # Get tokenizer from model
+        tokenizer = self.model.tokenizer
+
+        # Get quality level tokens
+        level_names = ["bad", "low", "fair", "good", "awesome"]
+        level_scores = [1.0, 2.0, 3.0, 4.0, 5.0]
+        level_token_ids = [
+            tokenizer.encode(f" {level_name}", add_special_tokens=False)[0]
+            for level_name in level_names
+        ]
+
+        # Process each sample in batch
+        for i in range(batch_size):
+            try:
+                # Extract data for this sample
+                pixel_values = inputs["pixel_values_A"][i:i+1]  # Keep batch dim
+                media_offset = [inputs["media_offset_A"][i]]
+                gt_score = inputs["gt_scores_A"][i].item()
+
+                # === Step 1: Generate scene answer ===
+                scene_messages = [
+                    {"role": "user", "content": "<|image|>\n"},
+                    {"role": "user", "content": "What is the scene type of this image?"},
+                ]
+
+                scene_text = tokenizer.apply_chat_template(
+                    scene_messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+
+                scene_encoding = tokenizer(scene_text, return_tensors="pt", add_special_tokens=False)
+                scene_input_ids = scene_encoding['input_ids'].to(pixel_values.device)
+                scene_attention_mask = scene_encoding['attention_mask'].to(pixel_values.device)
+
+                # Generate scene answer
+                scene_out = model.model.generate(
+                    input_ids=scene_input_ids,
+                    pixel_values=pixel_values,
+                    media_offset=media_offset,
+                    attention_mask=scene_attention_mask,
+                    tokenizer=tokenizer,
+                    max_new_tokens=50,
+                    do_sample=False,
+                    num_beams=1,
+                )
+
+                scene_response = tokenizer.decode(scene_out[0], skip_special_tokens=True).strip()
+
+                # === Step 2: Generate distortion answer ===
+                distortion_messages = [
+                    {"role": "user", "content": "<|image|>\n"},
+                    {"role": "user", "content": "What is the scene type of this image?"},
+                    {"role": "assistant", "content": scene_response},
+                    {"role": "user", "content": "What is the distortion type of this image?"},
+                ]
+
+                distortion_text = tokenizer.apply_chat_template(
+                    distortion_messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+
+                distortion_encoding = tokenizer(distortion_text, return_tensors="pt", add_special_tokens=False)
+                distortion_input_ids = distortion_encoding['input_ids'].to(pixel_values.device)
+                distortion_attention_mask = distortion_encoding['attention_mask'].to(pixel_values.device)
+
+                # Generate distortion answer
+                distortion_out = model.model.generate(
+                    input_ids=distortion_input_ids,
+                    pixel_values=pixel_values,
+                    media_offset=media_offset,
+                    attention_mask=distortion_attention_mask,
+                    tokenizer=tokenizer,
+                    max_new_tokens=50,
+                    do_sample=False,
+                    num_beams=1,
+                )
+
+                distortion_response = tokenizer.decode(distortion_out[0], skip_special_tokens=True).strip()
+
+                # === Step 3: Predict quality ===
+                quality_messages = [
+                    {"role": "user", "content": "<|image|>\n"},
+                    {"role": "user", "content": "What is the scene type of this image?"},
+                    {"role": "assistant", "content": scene_response},
+                    {"role": "user", "content": "What is the distortion type of this image?"},
+                    {"role": "assistant", "content": distortion_response},
+                    {"role": "user", "content": "What do you think about the quality of this image?"},
+                    {"role": "assistant", "content": "The quality of this image is "},
+                ]
+
+                quality_text = tokenizer.apply_chat_template(
+                    quality_messages,
+                    tokenize=False,
+                    continue_final_message=True,
+                )
+
+                quality_encoding = tokenizer(quality_text, return_tensors="pt", add_special_tokens=False)
+                quality_input_ids = quality_encoding['input_ids'].to(pixel_values.device)
+                quality_attention_mask = quality_encoding['attention_mask'].to(pixel_values.device)
+
+                # Forward pass to get logits
+                quality_outputs = model.model(
+                    input_ids=quality_input_ids,
+                    pixel_values=pixel_values,
+                    media_offset=media_offset,
+                    attention_mask=quality_attention_mask,
+                )
+
+                # Extract logits at last position
+                last_logits = quality_outputs.logits[0, -1, :]
+
+                # Get logits for quality tokens
+                level_logits = last_logits[level_token_ids]
+
+                # Compute softmax probabilities
+                level_probs = F.softmax(level_logits, dim=0)
+
+                # Compute expected score
+                expected_score = sum(prob.item() * score for prob, score in zip(level_probs, level_scores))
+
+                pred_scores.append(expected_score)
+                gt_scores.append(gt_score)
+
+            except Exception as e:
+                # Skip this sample if error occurs
+                print(f"[WARNING] Error evaluating sample {i} in batch: {e}")
+                continue
+
+        return pred_scores, gt_scores
     
     def evaluation_loop(self, *args, **kwargs):
         """

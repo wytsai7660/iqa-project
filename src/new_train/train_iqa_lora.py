@@ -69,10 +69,10 @@ def parse_args():
                         help="Enable distortion type classification task")
     
     # Loss arguments
-    parser.add_argument("--weight_ce", type=float, default=1.0,
-                        help="Weight for cross entropy loss")
+    parser.add_argument("--weight_ce", type=float, default=0.05,
+                        help="Weight for cross entropy loss (gamma from DeQA-Score paper)")
     parser.add_argument("--weight_kl", type=float, default=0.05,
-                        help="Weight for KL divergence loss")
+                        help="Weight for KL divergence loss (gamma from DeQA-Score paper)")
     parser.add_argument("--weight_fidelity", type=float, default=1.0,
                         help="Weight for fidelity loss")
     parser.add_argument("--use_fidelity_loss", action="store_true",
@@ -118,7 +118,9 @@ def parse_args():
                         help="Number of dataloader workers (default: 0 to avoid fork issues)")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
                         help="Use gradient checkpointing to save memory (default: True)")
-    
+    parser.add_argument("--use_weighted_sampling", action="store_true",
+                        help="Use weighted sampling to oversample underrepresented MOS bins")
+
     return parser.parse_args()
 
 
@@ -214,6 +216,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=collate_fn_pair,
+        use_weighted_sampling=args.use_weighted_sampling,
     )
     
     # Train
