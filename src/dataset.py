@@ -414,6 +414,89 @@ class PairDataset(Dataset[PairDatasetItem]):
 
         return weights
 
+    def get_sample_weights_by_scene(self) -> ndarray:
+        """
+        Compute sample weights based on scene1 frequency distribution.
+
+        Samples with underrepresented scenes receive higher weights.
+        Uses only scene1 (primary scene label) to avoid multi-label complexity.
+
+        Returns:
+            Array of weights, one per sample. Weights sum to len(dataset).
+
+        Example:
+            If scene counts are {'landscape': 3000, 'cityscape': 2000, 'night': 100}:
+            - landscape samples: weight ≈ 0.33 (low weight, overrepresented)
+            - cityscape samples: weight ≈ 0.50
+            - night samples: weight ≈ 10.0 (high weight, underrepresented)
+        """
+        all_weights = []
+
+        for dataset_index, data_frame in enumerate(self.dataset_labels_data_frames):
+            scene_labels = data_frame["scene1"].values
+
+            # Count frequency of each scene type
+            unique_scenes, scene_counts = np.unique(scene_labels, return_counts=True)
+
+            # Compute inverse frequency weights
+            scene_to_weight = {
+                scene: 1.0 / count
+                for scene, count in zip(unique_scenes, scene_counts)
+            }
+
+            # Assign weight to each sample based on its scene
+            sample_weights = np.array([scene_to_weight[scene] for scene in scene_labels])
+            all_weights.append(sample_weights)
+
+        # Concatenate weights from all datasets
+        weights = np.concatenate(all_weights)
+
+        # Normalize weights so they sum to the dataset size
+        weights = weights * len(weights) / weights.sum()
+
+        return weights
+
+    def get_sample_weights_by_distortion(self) -> ndarray:
+        """
+        Compute sample weights based on distortion type frequency distribution.
+
+        Samples with underrepresented distortions receive higher weights.
+
+        Returns:
+            Array of weights, one per sample. Weights sum to len(dataset).
+
+        Example:
+            If distortion counts are {'blur': 2000, 'noise': 1500, 'jpeg compression': 500}:
+            - blur samples: weight ≈ 0.50 (low weight, overrepresented)
+            - noise samples: weight ≈ 0.67
+            - jpeg compression samples: weight ≈ 2.0 (high weight, underrepresented)
+        """
+        all_weights = []
+
+        for dataset_index, data_frame in enumerate(self.dataset_labels_data_frames):
+            distortion_labels = data_frame["distortion"].values
+
+            # Count frequency of each distortion type
+            unique_distortions, distortion_counts = np.unique(distortion_labels, return_counts=True)
+
+            # Compute inverse frequency weights
+            distortion_to_weight = {
+                distortion: 1.0 / count
+                for distortion, count in zip(unique_distortions, distortion_counts)
+            }
+
+            # Assign weight to each sample based on its distortion
+            sample_weights = np.array([distortion_to_weight[dist] for dist in distortion_labels])
+            all_weights.append(sample_weights)
+
+        # Concatenate weights from all datasets
+        weights = np.concatenate(all_weights)
+
+        # Normalize weights so they sum to the dataset size
+        weights = weights * len(weights) / weights.sum()
+
+        return weights
+
 
 def collate_fn(batch):
     pass

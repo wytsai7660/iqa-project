@@ -29,8 +29,7 @@ class SimplifiedProgressCallback(TrainerCallback):
             # Show evaluation metrics when available
             elif 'eval_loss' in logs:
                 print(f"\n{'='*70}")
-                eval_mode = "Generated Context" if hasattr(self, 'trainer') and getattr(self.trainer, 'use_generated_context', False) else "GT Context (Teacher Forcing)"
-                print(f"📊 Validation Results at Epoch {logs.get('epoch', 0):.2f} [{eval_mode}]")
+                print(f"📊 Validation Results at Epoch {logs.get('epoch', 0):.2f}")
                 print(f"{'='*70}")
                 
                 # Total Loss
@@ -85,7 +84,7 @@ class IQATrainer(Trainer):
     to match test-time behavior.
     """
 
-    def __init__(self, *args, use_weighted_sampling: bool = False, use_generated_context: bool = True, **kwargs):
+    def __init__(self, *args, use_weighted_sampling: bool = False, weighting_attribute: str = "mos", use_generated_context: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         # Store references for metric computation
         self.eval_predictions = []
@@ -98,6 +97,7 @@ class IQATrainer(Trainer):
 
         # Weighted sampling configuration
         self.use_weighted_sampling = use_weighted_sampling
+        self.weighting_attribute = weighting_attribute  # "mos", "scene", or "distortion"
 
         # Use generated context during evaluation (no teacher forcing)
         self.use_generated_context = use_generated_context
@@ -108,10 +108,12 @@ class IQATrainer(Trainer):
 
     def get_train_dataloader(self):
         """
-        Override to support weighted sampling based on MOS distribution.
+        Override to support task-specific weighted sampling.
 
-        When use_weighted_sampling is True, uses WeightedRandomSampler to oversample
-        images from underrepresented MOS bins (e.g., low-quality images).
+        Supports three weighting strategies based on self.weighting_attribute:
+        - "mos": Weight by MOS distribution (default, for quality task)
+        - "scene": Weight by scene type distribution (for scene classification task)
+        - "distortion": Weight by distortion type distribution (for distortion classification task)
         """
         from torch.utils.data import DataLoader, WeightedRandomSampler
         from transformers.trainer_utils import seed_worker
@@ -119,14 +121,28 @@ class IQATrainer(Trainer):
         if not self.use_weighted_sampling:
             return super().get_train_dataloader()
 
-        # Check if dataset supports weighted sampling
-        if not hasattr(self.train_dataset, 'get_sample_weights'):
-            print("⚠️  Warning: Dataset does not support get_sample_weights(), using default sampling")
-            return super().get_train_dataloader()
+        # Get sample weights based on weighting attribute
+        if self.weighting_attribute == "scene":
+            if not hasattr(self.train_dataset, 'get_sample_weights_by_scene'):
+                print("⚠️  Warning: Dataset does not support scene-based weighting, using default sampling")
+                return super().get_train_dataloader()
+            sample_weights = self.train_dataset.get_sample_weights_by_scene()
+            print(f"📊 Using scene-based weighted sampling with {len(sample_weights)} samples")
 
-        # Get sample weights from dataset
-        sample_weights = self.train_dataset.get_sample_weights()
-        print(f"📊 Using weighted sampling with {len(sample_weights)} samples")
+        elif self.weighting_attribute == "distortion":
+            if not hasattr(self.train_dataset, 'get_sample_weights_by_distortion'):
+                print("⚠️  Warning: Dataset does not support distortion-based weighting, using default sampling")
+                return super().get_train_dataloader()
+            sample_weights = self.train_dataset.get_sample_weights_by_distortion()
+            print(f"📊 Using distortion-based weighted sampling with {len(sample_weights)} samples")
+
+        else:  # Default: "mos"
+            if not hasattr(self.train_dataset, 'get_sample_weights'):
+                print("⚠️  Warning: Dataset does not support MOS-based weighting, using default sampling")
+                return super().get_train_dataloader()
+            sample_weights = self.train_dataset.get_sample_weights()
+            print(f"📊 Using MOS-based weighted sampling with {len(sample_weights)} samples")
+
         print(f"   Weight range: [{sample_weights.min():.4f}, {sample_weights.max():.4f}]")
 
         # Create weighted sampler

@@ -59,6 +59,26 @@ class IQAPairDataset(Dataset):
         """
         return self.pair_dataset.get_sample_weights()
 
+    def get_sample_weights_by_scene(self) -> np.ndarray:
+        """
+        Get sample weights based on scene type distribution.
+        Delegates to the underlying PairDataset.
+
+        Returns:
+            Array of weights, one per sample.
+        """
+        return self.pair_dataset.get_sample_weights_by_scene()
+
+    def get_sample_weights_by_distortion(self) -> np.ndarray:
+        """
+        Get sample weights based on distortion type distribution.
+        Delegates to the underlying PairDataset.
+
+        Returns:
+            Array of weights, one per sample.
+        """
+        return self.pair_dataset.get_sample_weights_by_distortion()
+
     def __getitem__(self, idx):
         pair_item = self.pair_dataset[idx]
         
