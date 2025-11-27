@@ -7,9 +7,9 @@ code in this repository.
 ## Introduction
 
 This is an Image Quality Assessment (IQA) project that is based on the IQA
-methods described in the papers deqa-score.pdf (DeQA-Score) and liqe.pdf (LIQE).
-Read those two PDFs to understand their techniques. The goal of this project is
-to combine the techniques of DeQA-Score and LIQE.
+methods described in the papers `deqa-score.pdf` (DeQA-Score) and `liqe.pdf`
+(LIQE). Read those two PDFs to understand their techniques. The goal of this
+project is to combine the techniques of DeQA-Score and LIQE.
 
 DeQA-Score uses the mPLUG-Owl2 multimodal large language model (MLLM) to predict
 image mean opinion scores (MOS). Normally, an MLLM can't directly predict a
@@ -58,84 +58,13 @@ previous one's context.
 Your goal is to find any flaws and bugs in the training or evaluation process
 and correct them to improve the model's PLCC and SRCC performance.
 
-## Setup and Environment
+## Training
 
-**Package Manager**: This project uses `uv` for dependency management.
+`train_sequential_configurable.ipynb` is the main script used for training.
 
-```bash
-# Install dependencies
-uv sync
+## Evaluation
 
-# Run Python scripts/modules
-uv run python <script.py>
-uv run -m <module.path>
-```
-
-**Python Version**: 3.12 (see `.python-version`)
-
-**Key Dependencies**:
-
-- PyTorch 2.8.0 with flash-attention
-- transformers 4.47.0
-- peft (for LoRA)
-- Custom mPLUG-Owl3 code in `src/owl3/`
-
-## Training Commands
-
-### Quick Demo (10 steps per task)
-
-```bash
-bash run_quick_demo.sh
-```
-
-### Full Sequential Training
-
-```bash
-bash run_sequential_training.sh
-```
-
-### Individual Task Training
-
-```bash
-# Stage 1: Scene Classification
-uv run -m src.new_train.train_scene \
-    --dataset_paths datasets/bid/ \
-    --output_dir outputs/01_scene \
-    --num_train_epochs 3
-
-# Stage 2: Distortion Classification (loads Stage 1 model)
-uv run -m src.new_train.train_distortion \
-    --dataset_paths datasets/bid/ \
-    --output_dir outputs/02_distortion \
-    --model_name_or_path outputs/01_scene/final \
-    --num_train_epochs 3
-
-# Stage 3: Quality Assessment (loads Stage 2 model)
-uv run -m src.new_train.train_iqa_lora \
-    --dataset_paths datasets/bid/ \
-    --output_dir outputs/03_quality \
-    --model_name_or_path outputs/02_distortion/final \
-    --num_train_epochs 3 \
-    --use_fidelity_loss
-```
-
-### In-Memory Sequential Pipeline
-
-```bash
-uv run python train_sequential_pipeline.py \
-    --dataset_paths datasets/bid/ \
-    --output_dir outputs/sequential_pipeline \
-    --num_train_epochs 3
-```
-
-### Evaluation
-
-```bash
-uv run python eval_sequential_model.py \
-    --model_path outputs/03_quality/final \
-    --dataset_paths datasets/koniq-10k/ \
-    --split testing
-```
+Use `eval_sequential_model.py` to evaluate the model.
 
 ## Code Architecture
 
@@ -159,20 +88,7 @@ uv run python eval_sequential_model.py \
     Distortion → Quality (full)
 - Returns `PairDatasetItem` with two images and their labels for ranking loss
 
-**`src/config.py`** - Project-level configuration
-
-- `SRC_DIR`: Source directory path
-- `MODEL_DIR`: Points to `src/owl3/`
-- `QUALITY_TOKENS`: Quality level tokens (currently empty, defaults in code)
-
 ### Training Framework (`src/new_train/`)
-
-**`config.py`** - Training configuration dataclasses
-
-- `ModelConfig`: LoRA settings, quality tokens, model paths
-- `DataConfig`: Dataset paths and preprocessing settings
-- `LossConfig`: Loss function weights and settings
-- `TrainingConfig`: Training hyperparameters
 
 **`model_wrapper.py`** - `IQAModelWrapper` class
 
@@ -208,20 +124,6 @@ uv run python eval_sequential_model.py \
 **`processor_no_cut.py`** - Custom processor
 
 - `create_processor_no_cut()`: Creates processor without image cutting/splitting
-
-### Training Scripts
-
-- `train_scene.py`: Train scene classification (Stage 1)
-- `train_distortion.py`: Train distortion classification (Stage 2)
-- `train_iqa_lora.py`: Train quality assessment with LoRA (Stage 3)
-- `train_sequential_pipeline.py`: All-in-one pipeline script
-
-### Evaluation Scripts
-
-- `eval_sequential_model.py`: True sequential evaluation (model generates
-  context)
-- `evaluate_model.py`: Simple quality evaluation
-- Various `test_*.py` and `debug_*.py`: Unit tests and debugging utilities
 
 ### Dataset Preprocessing (`src/dataset_preprocessing_scripts/`)
 
@@ -292,7 +194,7 @@ score = Σ p_i * score_i  where p_i = softmax(logits[quality_tokens])
    filler text)
 2. **KL Divergence Loss**: Applied to quality token position with Gaussian soft
    labels
-3. **Fidelity Loss** (optional): Ranking loss for image pairs based on quality
+3. **Fidelity Loss**: Ranking loss for image pairs based on quality
    difference
 
 ### LoRA Configuration
@@ -314,34 +216,7 @@ Default hyperparameters:
 Training saves:
 
 - Periodic checkpoints at `save_steps` intervals
-- `final/` directory with the final model
-- TensorBoard logs in `runs/`
+- `final_model/` directory with the final model
 
 To load a checkpoint for continued training, use `--model_name_or_path
 <checkpoint_dir>`.
-
-### Jupyter Notebooks
-
-Training notebooks are in the root directory:
-
-- `train_quality_only.ipynb`: Quality-only training
-- `train_sequential_configurable.ipynb`: Configurable sequential training
-- `train_sequential_pipeline.ipynb`: Sequential pipeline
-
-These are interactive alternatives to the Python scripts.
-
-## Working with This Codebase
-
-1. **Dataset location**: The `datasets/` directory contains the datasets to use.
-
-2. **Model source**: The base mPLUG-Owl3 model is in `src/owl3/`. It is not
-   loaded from HuggingFace Hub.
-
-3. **Training workflow**: The three-stage sequential training is the recommended
-   approach. Each stage loads the previous stage's model.
-
-4. **Debugging**: Many `test_*.py` and `debug_*.py` scripts exist for verifying
-   specific components. Run them with `uv run python <script.py>`.
-
-5. **Type checking**: Configured with Pyright in `pyproject.toml` (currently
-   using standard mode).
