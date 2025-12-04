@@ -20,3 +20,6 @@ outputs
 
 # Jupyter Notebook output
 nb.log
+
+# Gradio temporary files
+.gradio/
